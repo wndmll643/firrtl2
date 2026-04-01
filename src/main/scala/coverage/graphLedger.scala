@@ -273,6 +273,86 @@ class graphLedger(val module: DefModule) {
     ).map(_._1)
   }
 
+  // Find registers in the backward cone of narrow output ports.
+  // "Control outputs" are Output ports with width <= maxOutputWidth (e.g. ready/valid, exceptions).
+  // Traces backward from each such port to find all registers that can influence it.
+  // Must call reverseEdge (via findMuxSrcs or explicitly) before using this method.
+  def findControlConeRegs(maxOutputWidth: Int = 16): Set[DefRegister] = {
+    if (reverseMap.isEmpty)
+      return Set[DefRegister]()
+
+    val coneRegs = mutable.Set[DefRegister]()
+    val outputPorts = module.ports.filter { p =>
+      p.direction == Output &&
+        p.tpe != ClockType &&
+        !p.name.toLowerCase.contains("clock") &&
+        !p.name.toLowerCase.contains("reset")
+    }
+
+    for (port <- outputPorts) {
+      val width = port.tpe match {
+        case UIntType(IntWidth(w)) => w.toInt
+        case SIntType(IntWidth(w)) => w.toInt
+        case _ => Int.MaxValue
+      }
+      if (width <= maxOutputWidth && reverseMap.contains(port.name)) {
+        val srcs = findSrcs(port.name, ListBuffer[String]())
+        for (srcName <- srcs) {
+          if (graphMap.contains(srcName)) {
+            graphMap(srcName)._1.node match {
+              case reg: DefRegister => coneRegs.add(reg)
+              case _ =>
+            }
+          }
+        }
+      }
+    }
+    coneRegs.toSet
+  }
+
+  // Find registers whose values are input-derived within N hops.
+  // Generalizes findDirInRegs (which does 2-hop) to arbitrary depth.
+  // - Hop 1: register D-input sources are all input ports
+  // - Hop 2: register D-input sources are all input ports or hop-1 registers
+  // - ...
+  // Only considers candidates (typically cone regs); non-candidate source regs
+  // are treated as non-input-derived (conservative).
+  def findInputDerivedRegs(candidates: Set[DefRegister], maxHops: Int = 3): Set[DefRegister] = {
+    if (reverseMap.isEmpty || candidates.isEmpty)
+      return Set[DefRegister]()
+
+    val candidateNames = candidates.map(_.name)
+    val accumulated = mutable.Set[String]()
+
+    for (_ <- 1 to maxHops) {
+      val newThisHop = mutable.Set[DefRegister]()
+      for (reg <- candidates) {
+        if (!accumulated.contains(reg.name) && reverseMap.contains(reg.name)) {
+          // Find all terminal sources of this register's D-input
+          val srcs = reverseMap(reg.name)._2.flatMap(src =>
+            findSrcs(src, ListBuffer[String]())
+          ).filter(src => src != reg.name)  // remove self-loop
+
+          // Keep only sources that are ports or candidate registers
+          val relevantSrcs = srcs.filter(src =>
+            portNames.contains(src) || candidateNames.contains(src)
+          )
+
+          // If ALL relevant sources are input ports or already-accumulated regs,
+          // this register is input-derived
+          if (relevantSrcs.nonEmpty && relevantSrcs.forall(src =>
+            portNames.contains(src) || accumulated.contains(src)
+          )) {
+            newThisHop.add(reg)
+          }
+        }
+      }
+      if (newThisHop.isEmpty) return accumulated.flatMap(name => candidates.find(_.name == name)).toSet
+      accumulated ++= newThisHop.map(_.name)
+    }
+    accumulated.flatMap(name => candidates.find(_.name == name)).toSet
+  }
+
   // Find vector registers using the feature of Chisel.
   // Vertor registers in Chisel leave Source information
   def findVecRegs: Set[Tuple3[Int, String, Set[String]]] = {
