@@ -88,6 +88,72 @@ Both v8 variants add two improvements over v7: **cone+origin register filtering*
 
 v8a vs v8b isolates whether input selection strategy matters when combined with improved register filtering and transition tracking.
 
+**v8 result (failed)**: AFL-style transition coverage was the wrong abstraction for hardware. v8a saturated at exactly 5 coverage states across 84% of micro_boom_720 runs (251/300), and 4 states in the rest. Reason: in RTL, consecutive cycles differ by only 1-2 bits, so `addr XOR (prev_addr >> 1)` produces near-zero transition addresses that all collapse to the same map entries. v8b was no better than v6b (1216 vs 1118 mean coverage). The v8 line is dropped going forward.
+
+### v9a/v9b/v9c/v9d: direct-concat or XOR-fold (replace bucket XOR-reduce)
+
+The v9 family targets the root cause that bottlenecked v6/v7/v8: the bucket XOR-reduce hash in `buildHash` collapses each bucket of N bits to a single parity bit, causing ~50% collision probability per bucket. v9 introduces two replacement hash functions:
+
+- **`buildHashFold`** (XOR-fold): split N concatenated input bits into chunks of `outWidth`, then XOR the chunks position-by-position. Preserves positional information within each chunk; only bits exactly `outWidth` apart can cancel.
+- **`buildDirectOrFold`** (direct-or-fold): if `numBits <= outWidth`, **directly concatenate** all bits with zero-padding (zero information loss). If `numBits > outWidth`, fall back to `buildHashFold`. Most modules in real designs fit within `maxAddrWidth=20`, so the direct path activates often.
+
+All v9 variants also widen `submodHashSize` from 6 to 12-16 bits, recovering child-module information that v6/v7 discarded. A new `maxAddrWidth=20` cap (1M coverage map entries) bounds memory growth for large modules.
+
+- **v9a** (`hierCoverage_v9a`): **direct-or-fold** + v6b-style fixed sizing. Maps to v6b's architecture with the bucket hash swapped out.
+  - Hash function: `buildDirectOrFold` (direct concat when bits fit, XOR-fold otherwise).
+  - Sizing: `min(numBits, cap)` — no log2, no dynamic scaling. `maxInputHashSize=6`, `maxCoreHashSize=14` (widened from v6b's 8).
+  - `submodHashSize=16` (widened from v6b's 6) — children pass 2.7x more state to parents.
+  - `maxAddrWidth=20` cap; `bucketCount=16`.
+  - No extmodule proxy (matches v6b).
+
+- **v9b** (`hierCoverage_v9b`): **direct-or-fold** + v7b-style dynamic sizing + extmodule proxy + 32 buckets.
+  - Hash function: `buildDirectOrFold`.
+  - Sizing: `min(numBits, cap)` with `minHashSize=4` floor — preserves more bits than v7b's `log2(numBits)` compression. `maxInputHashSize=10`, `maxCoreHashSize=14`.
+  - `submodHashSize=16`, `bucketCount=32` (doubled), `maxBucketSigBits=256` (doubled).
+  - `maxAddrWidth=20` cap.
+  - Includes extmodule input port proxy from v7b.
+
+- **v9c** (`hierCoverage_v9c`): **XOR-fold only** + v6b-style fixed sizing. Tests whether the better hash function alone (without direct-concat path) is sufficient.
+  - Hash function: `buildHashFold` (XOR-fold, no direct path).
+  - Otherwise mirrors v9a parameters; `submodHashSize=12`.
+
+- **v9d** (`hierCoverage_v9d`): **XOR-fold only** + v7b-style dynamic log2 sizing + extmodule proxy.
+  - Hash function: `buildHashFold`.
+  - Otherwise mirrors v7b architecture (dynamic log2 sizing preserved), with `submodHashSize=16`.
+
+**v9 results (200 runs each on micro_boom_720, the hard LSU bug)**:
+
+| Variant | Mean TTB (cycles) | Mean coverage | Notes |
+|---|---|---|---|
+| **v9a** | **275,451** | 8,924 | **Fastest TTB across all variants — winner** |
+| v6b | 294,426 | 1,118 | Previous TTB best (8x less coverage than v9a) |
+| reg (DifuzzRTL) | 299,394 | — | Reference baseline |
+| v9c | 313,482 | 3,325 | XOR-fold without direct path: worse than v9a |
+| v9d | 327,047 | 15,082 | XOR-fold + dynamic sizing: similar to v7b |
+| rand | 343,994 | — | Random baseline |
+| v9b | 346,108 | **32,835** | Highest coverage but slow TTB (corpus bloat) |
+| v7b | 355,923 | 15,380 | Previous coverage best |
+
+Key takeaways from the v9 experiment:
+
+1. **v9a is the best overall** — fastest mean TTB across all variants including DifuzzRTL's register coverage. It finds the LSU bug 6.4% faster than v6b and 20% faster than random fuzzing. The combination of direct-concat hashing + fixed moderate sizing + wider hierarchy pipe (`submodHashSize=16`) hits the right granularity sweet spot.
+2. **Direct-or-fold beats XOR-fold-only**: matched pairs v9a vs v9c (8x more coverage for v9a) and v9b vs v9d (2.2x more coverage for v9b) prove that the direct-concat path is the crucial improvement, not the XOR-fold alone.
+3. **More coverage hurts TTB**: v9b has 3.7x more coverage than v9a but ranks 7th in TTB — worse than random. Excessively fine-grained coverage causes corpus bloat with near-duplicate seeds.
+4. **Fixed sizing > dynamic sizing for bug-finding**: v9a (fixed) beats v9b (dynamic) on TTB, and v9c beats v9d on TTB. Dynamic sizing helps coverage growth but doesn't help reach bug-triggering states faster.
+
+## What survived (current best variants)
+
+After running all variants (v1 through v9), only two are recommended for active use:
+
+- **v9a — primary recommendation.** Fastest time-to-bug on the hard benchmark (micro_boom_720), beating v6b, v7b, DifuzzRTL register coverage, and random. Also produces 8x more coverage than v6b. The direct-or-fold hash with fixed `min(numBits, cap)` sizing avoids the bucket-collision bottleneck without bloating the corpus. Use this for default hierarchical-coverage fuzzing.
+- **v6b — proven baseline.** The best of the bucket-XOR-reduce family. Still useful as a stable, well-understood reference and as a sanity check when comparing v9 against the prior generation. Second-best TTB (294K cycles).
+
+Variants to avoid:
+- **v8a/v8b**: transition coverage doesn't work in hardware (v8a saturates at 5 states).
+- **v9b**: too much coverage, corpus bloat hurts TTB.
+- **v9c/v9d**: XOR-fold-only is dominated by v9a/v9b's direct-concat path.
+- **v6a, v7, v7b**: superseded by v9a. v7b coverage growth is matched by v9d but with worse TTB.
+
 ## Version comparison
 
 ### Signal selection strategy
@@ -102,6 +168,10 @@ v8a vs v8b isolates whether input selection strategy matters when combined with 
 | v7b | Control input ports only | Control registers + child hash + extmodule proxy | Yes |
 | v8a | Data input ports (non-control) | Cone+origin regs + child hash + extmodule proxy | Yes (cone+origin + transition) |
 | v8b | Control input ports only | Cone+origin regs + child hash + extmodule proxy | Yes (cone+origin + transition) |
+| **v9a** | **Control input ports only** | **Control regs + wide child hash (16b)** | **Yes** |
+| v9b | Control input ports only | Control regs + wide child hash (16b) + extmodule proxy | Yes |
+| v9c | Control input ports only | Control regs + child hash (12b) | Yes |
+| v9d | Control input ports only | Control regs + wide child hash (16b) + extmodule proxy | Yes |
 
 ### Register filtering strategy
 
@@ -110,6 +180,7 @@ v8a vs v8b isolates whether input selection strategy matters when combined with 
 | v1–v5 | All registers | None |
 | v6a, v6b, v7, v7b | Mux-source registers | `graphLedger.findMuxSrcs` → `ctrlRegs` |
 | v8a, v8b | Cone ∩ ¬InputDerived | `graphLedger.findControlConeRegs` − `findInputDerivedRegs` → `v8Regs` |
+| **v9a, v9b, v9c, v9d** | **Mux-source registers** (same as v6) | `graphLedger.findMuxSrcs` → `ctrlRegs` |
 
 ### Hash sizing strategy
 
@@ -119,33 +190,45 @@ v8a vs v8b isolates whether input selection strategy matters when combined with 
 | v5 | Fixed 8 | Fixed 10 |
 | v6a, v6b | `min(6, numBits)` | `min(6, numBits)` |
 | v7, v7b, v8a, v8b | `max(4, min(10, log2(numBits)))` | `max(4, min(12, log2(numBits)))` |
+| **v9a** | `min(6, numBits)` | `min(14, numBits)` (capped by `maxAddrWidth=20`) |
+| v9b | `max(4, min(10, numBits))` | `max(4, min(14, numBits))` (capped by `maxAddrWidth=20`) |
+| v9c | `min(6, numBits)` | `min(14, numBits)` (capped by `maxAddrWidth=20`) |
+| v9d | `max(4, min(10, log2(numBits)))` | `max(4, min(14, log2(numBits)))` |
 
 ### Parameters by version
 
-| Parameter | v1/v3 | v2/v4 | v5 | v6a | v6b | v7/v7b | v8a/v8b |
-|-----------|-------|-------|----|-----|-----|--------|---------|
-| inputHashSize / maxInputHashSize | 6 | 6 | 8 | 6 | 6 | 10 | 10 |
-| coreHashSize / maxCoreHashSize | 8 | 8 | 10 | 6 | 6 | 12 | 12 |
-| minHashSize | — | — | — | — | — | 4 | 4 |
-| submodHashSize | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
-| maxInputPorts | 8 | 8 | — | 8 | 8 | 8 | 8 |
-| maxBitsPerPort | 8 | 8 | 8 | 8 | 8 | 8 | 8 |
-| maxRegBits | 64 | 64 | 64 | 64 | 64 | 256 | 256 |
-| maxCtrlRegWidth | — | — | — | 20 | 20 | 20 | 20 |
-| bucketCount | — | 16 | 16 | 16 | 16 | 16 | 16 |
-| bucketWidth | — | 8 | 8 | 8 | 8 | 8 | 8 |
-| maxExtModPorts | — | — | — | — | — | 16 | 16 |
-| maxExtModBitsPerPort | — | — | — | — | — | 8 | 8 |
-| maxControlOutputWidth | — | — | — | — | — | — | 16 |
-| maxOriginHops | — | — | — | — | — | — | 3 |
+| Parameter | v1/v3 | v2/v4 | v5 | v6a | v6b | v7/v7b | v8a/v8b | **v9a** | v9b | v9c | v9d |
+|-----------|-------|-------|----|-----|-----|--------|---------|-----|-----|-----|-----|
+| inputHashSize / maxInputHashSize | 6 | 6 | 8 | 6 | 6 | 10 | 10 | **6** | 10 | 6 | 10 |
+| coreHashSize / maxCoreHashSize | 8 | 8 | 10 | 6 | 6 | 12 | 12 | **14** | 14 | 14 | 14 |
+| minHashSize | — | — | — | — | — | 4 | 4 | **—** | 4 | — | 4 |
+| maxAddrWidth (new) | — | — | — | — | — | — | — | **20** | 20 | 20 | — |
+| submodHashSize | 6 | 6 | 6 | 6 | 6 | 6 | 6 | **16** | 16 | 12 | 16 |
+| maxInputPorts | 8 | 8 | — | 8 | 8 | 8 | 8 | **8** | 8 | 8 | 8 |
+| maxBitsPerPort | 8 | 8 | 8 | 8 | 8 | 8 | 8 | **8** | 8 | 8 | 8 |
+| maxRegBits | 64 | 64 | 64 | 64 | 64 | 256 | 256 | **64** | 256 | 64 | 256 |
+| maxCtrlRegWidth | — | — | — | 20 | 20 | 20 | 20 | **20** | 20 | 20 | 20 |
+| bucketCount | — | 16 | 16 | 16 | 16 | 16 | 16 | **16** | 32 | 16 | 16 |
+| bucketWidth | — | 8 | 8 | 8 | 8 | 8 | 8 | **8** | 8 | 8 | 8 |
+| maxBucketSigBits | — | 128 | 128 | 128 | 128 | 128 | 128 | **128** | 256 | 128 | 128 |
+| maxExtModPorts | — | — | — | — | — | 16 | 16 | **—** | 16 | — | 16 |
+| maxExtModBitsPerPort | — | — | — | — | — | 8 | 8 | **—** | 8 | — | 8 |
+| maxControlOutputWidth | — | — | — | — | — | — | 16 | **—** | — | — | — |
+| maxOriginHops | — | — | — | — | — | — | 3 | **—** | — | — | — |
+| Hash function | bucket XOR-reduce | bucket XOR-reduce | bucket XOR-reduce | bucket XOR-reduce | bucket XOR-reduce | bucket XOR-reduce | bucket XOR-reduce | **direct-or-fold** | direct-or-fold | XOR-fold | XOR-fold |
 
 ## How to use
 Add the transform to your FIRRTL pipeline via `-fct`:
+
+**Recommended default**: `hier_cov.hierCoverage_v9a` — fastest time-to-bug across all variants. Use v6b as a stable reference baseline if you need to compare against the prior generation.
+
+All available passes:
 - `hier_cov.hierCoverage` (v1), `hier_cov.hierCoverage_v2`, `hier_cov.hierCoverage_v3`, `hier_cov.hierCoverage_v4`
 - `hier_cov.hierCoverage_v4_fix` (v4 + SInt fix)
 - `hier_cov.hierCoverage_v6a`, `hier_cov.hierCoverage_v6b`
 - `hier_cov.hierCoverage_v7`, `hier_cov.hierCoverage_v7b`
-- `hier_cov.hierCoverage_v8a`, `hier_cov.hierCoverage_v8b`
+- `hier_cov.hierCoverage_v8a`, `hier_cov.hierCoverage_v8b` *(deprecated — transition coverage failed in hardware)*
+- **`hier_cov.hierCoverage_v9a`** *(recommended)*, `hier_cov.hierCoverage_v9b`, `hier_cov.hierCoverage_v9c`, `hier_cov.hierCoverage_v9d`
 
 ## Expected results
 - Each module gets two new output ports: `io_hierCovSum` (32-bit) and `io_hierCovHash`.
