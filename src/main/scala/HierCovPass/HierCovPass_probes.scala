@@ -20,6 +20,8 @@ import java.io.{File, PrintWriter}
 import firrtl2._
 import firrtl2.ir._
 import firrtl2.Mappers._
+import firrtl2.annotations.{Annotation, ModuleTarget, ReferenceTarget}
+import firrtl2.transforms.DontTouchAnnotation
 
 import scala.collection.mutable
 import scala.collection.mutable.ListBuffer
@@ -168,8 +170,15 @@ class hierCoverageProbes extends Transform {
       newMod
     }
 
+    // Mark every emitted probe DefNode as DontTouch so DCE / constant
+    // propagation / Verilog emission don't strip these wires (their only
+    // purpose is VCD observability; they have no consumers in the circuit).
+    val dontTouches: Seq[Annotation] = manifest.toSeq.map { e =>
+      DontTouchAnnotation(ModuleTarget(newCircuit.main, e.module).ref(e.probe))
+    }
+
     writeManifest(newCircuit.main, manifest.toSeq, sigs.toSeq)
-    state.copy(newCircuit)
+    state.copy(circuit = newCircuit, annotations = state.annotations ++ dontTouches)
   }
 
   private def writeManifest(
