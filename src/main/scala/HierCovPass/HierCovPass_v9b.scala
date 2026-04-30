@@ -1,10 +1,15 @@
-// v9b: eliminate hashing variant based on v7b.
-// Uses direct bit concatenation when sampled bits fit within address width (zero loss).
-// Falls back to XOR-fold when bits exceed address width.
-// Key change from v7b: NO log2 compression — uses min(numBits, cap) for hash sizing.
-// Widens maxCoreHashSize from 12 to 14, adds maxAddrWidth=20 cap.
-// Widens submodHashSize from 6 to 16, doubles bucketCount from 16 to 32.
-// Keeps v7b features: extmodule I/O proxy, raised maxRegBits=256, control-input-only.
+// hier_cov.hierCoverage_v9b — maximum-coverage variant.
+//
+// Selection : control input ports + control regs + ExtModule input-port proxy
+// Hashing   : direct-or-fold (same as v9a)
+// Sizing    : min(numBits, cap) (the minHashSize floor in the original
+//             collapses to min(cap, n) for v9b's parameter values)
+// Hash pipe : 16-bit io_hierCovHash to parents
+// Notable   : 32-way bucket histogram (vs v9a's 16), 256 maxRegBits (vs 64),
+//             extmodule input-port proxy folded into core hash.
+//
+// Highest absolute coverage; not the fastest TTB. Refactored to call into
+// hier_cov.lib (DUP-1).
 package hier_cov
 
 import java.io.{File, PrintWriter}
@@ -12,576 +17,29 @@ import java.io.{File, PrintWriter}
 import firrtl2._
 import firrtl2.ir._
 import firrtl2.Mappers._
-import firrtl2.PrimOps._
 
 import scala.collection.mutable
-import scala.collection.mutable.ListBuffer
 
 import coverage.graphLedger
 
-case class HierCovParamsV9b(
-  maxInputHashSize: Int = 10,    // v7b-style
-  maxCoreHashSize: Int = 14,     // widened from 12
-  minHashSize: Int = 4,          // v7b-style floor
-  maxAddrWidth: Int = 20,        // NEW: hard cap on total address width (2^20 = 1M entries)
-  submodHashSize: Int = 16,      // widened from 6
-  covSumSize: Int = 32,
-  maxInputPorts: Int = 8,
-  maxBitsPerPort: Int = 8,
-  maxRegBits: Int = 256,         // v7b-style
-  maxCtrlRegWidth: Int = 20,
-  maxExtModPorts: Int = 16,      // v7b-style
-  maxExtModBitsPerPort: Int = 8, // v7b-style
-  bucketCount: Int = 32,         // doubled from 16 for finer granularity
-  bucketWidth: Int = 8,
-  maxBucketSigBits: Int = 256    // doubled to match wider submodHashSize
-)
-
-object HierCovUtilV9b {
-  def stableHash(s: String): Int = {
-    s.foldLeft(0)((h, c) => (h * 31 + c.toInt) & 0x7fffffff)
-  }
-
-  def hasClock(mod: Module): (String, Boolean) = {
-    val clockName = mod.ports.find(p => p.name == "clock" || p.name == "gated_clock" || p.name == "clk").map(_.name)
-    (clockName.getOrElse("None"), clockName.isDefined)
-  }
-
-  def typeWidthOpt(tpe: Type): Option[Int] = tpe match {
-    case UIntType(IntWidth(w)) => Some(w.toInt)
-    case SIntType(IntWidth(w)) => Some(w.toInt)
-    case _ => None
-  }
-
-  def bitExtract(expr: Expression, idx: Int, tpe: Type): Expression = {
-    val width = typeWidthOpt(tpe).getOrElse(
-      throw new Exception(s"Unsupported type width: ${tpe.serialize}")
-    )
-    val asUInt = tpe match {
-      case UIntType(_) => expr
-      case SIntType(_) => DoPrim(AsUInt, Seq(expr), Seq(), UIntType(IntWidth(width)))
-      case _ => throw new Exception(s"Unsupported type for bitExtract: ${tpe.serialize}")
-    }
-    DoPrim(Bits, Seq(asUInt), Seq(idx, idx), UIntType(IntWidth(1)))
-  }
-
-  def xorReduce(bits: Seq[Expression]): Expression = {
-    if (bits.isEmpty) {
-      UIntLiteral(0, IntWidth(1))
-    } else {
-      bits.reduce((a, b) => DoPrim(Xor, Seq(a, b), Seq(), UIntType(IntWidth(1))))
-    }
-  }
-
-  def catBits(bits: Seq[Expression]): Expression = {
-    if (bits.isEmpty) {
-      UIntLiteral(0, IntWidth(1))
-    } else if (bits.length == 1) {
-      bits.head
-    } else {
-      var acc = bits.head
-      var accWidth = 1
-      for (b <- bits.tail) {
-        accWidth = accWidth + 1
-        acc = DoPrim(Cat, Seq(acc, b), Seq(), UIntType(IntWidth(accWidth)))
-      }
-      acc
-    }
-  }
-
-  def log2Ceil(x: Int): Int = {
-    var v = x - 1
-    var r = 0
-    while (v > 0) {
-      v = v >> 1
-      r = r + 1
-    }
-    r
-  }
-
-  // Select bits from CONTROL input ports only — ports that DO feed mux selects.
-  // Focuses on control-flow signals for input hash (v6b strategy).
-  def selectControlInputBits(ports: Seq[Port], ctrlPortNames: Set[String], params: HierCovParamsV9b): Seq[(Expression, String)] = {
-    val ctrlInputs = ports
-      .filter(p => p.direction == Input)
-      .filterNot { p =>
-        val lname = p.name.toLowerCase
-        p.tpe == ClockType || lname.contains("clock") || lname.contains("reset")
-      }
-      .filter(p => p.tpe.isInstanceOf[UIntType] || p.tpe.isInstanceOf[SIntType])
-      .filter(p => ctrlPortNames.contains(p.name))   // only control inputs
-
-    val limitedPorts = ctrlInputs.take(params.maxInputPorts)
-
-    limitedPorts.flatMap { p =>
-      typeWidthOpt(p.tpe).toSeq.flatMap { width =>
-        val bitsToTake = Math.min(params.maxBitsPerPort, width)
-        val stride = Math.max(1, width / bitsToTake)
-        val bitIdxs = (0 until width by stride).take(bitsToTake)
-        bitIdxs.map { idx =>
-          val bit = bitExtract(WRef(p), idx, p.tpe)
-          (bit, s"${p.name}[$idx]")
-        }
-      }
-    }
-  }
-
-  // Select bits from CONTROL registers only (registers feeding mux selects).
-  // Excludes dirInRegs (directly-input-fed regs, width > 3) and wide regs (>= maxCtrlRegWidth).
-  def selectControlRegBits(
-    ctrlRegs: scala.collection.Set[DefRegister],
-    dirInRegs: scala.collection.Set[DefRegister],
-    params: HierCovParamsV9b
-  ): Seq[(Expression, String)] = {
-    val filteredDirIn = dirInRegs.filter(r => typeWidthOpt(r.tpe).getOrElse(0) > 3)
-    val regs = ctrlRegs
-      .filterNot(filteredDirIn.contains(_))
-      .filter(r => typeWidthOpt(r.tpe).getOrElse(0) < params.maxCtrlRegWidth)
-      .toSeq
-
-    val bits = ListBuffer[(Expression, String)]()
-    for (reg <- regs) {
-      typeWidthOpt(reg.tpe).foreach { width =>
-        val stride = Math.max(1, width / Math.min(width, 8))
-        val bitIdxs = (0 until width by stride)
-        for (idx <- bitIdxs) {
-          bits.append((bitExtract(WRef(reg), idx, reg.tpe), s"${reg.name}[$idx]"))
-          if (bits.size >= params.maxRegBits) return bits.toSeq
-        }
-      }
-    }
-    bits.toSeq
-  }
-
-  // v9b: direct concatenation when bits fit, XOR-fold fallback when they don't.
-  // Sorts bits by stableHash(name) for deterministic ordering.
-  // If bits.size <= outWidth: direct concatenation (zero-padded) — ZERO information loss.
-  // If bits.size > outWidth: XOR-fold to outWidth.
-  def buildDirectOrFold(bits: Seq[(Expression, String)], outWidth: Int, baseName: String): (Expression, Seq[Statement]) = {
-    if (outWidth <= 0 || bits.isEmpty) {
-      return (UIntLiteral(0, IntWidth(Math.max(1, outWidth))), Seq[Statement]())
-    }
-
-    val sortedBits = bits.sortBy { case (_, name) => stableHash(name) }
-    val numBits = sortedBits.size
-
-    if (numBits <= outWidth) {
-      val allBitExprs = sortedBits.map(_._1)
-      val padded = allBitExprs ++ Seq.fill(outWidth - numBits)(UIntLiteral(0, IntWidth(1)))
-      val concatWire = DefWire(NoInfo, s"${baseName}_hash", UIntType(IntWidth(outWidth)))
-      val catExpr = catBits(padded.reverse)
-      val concatCon = Connect(NoInfo, WRef(concatWire), catExpr)
-      (WRef(concatWire), Seq(concatWire, concatCon))
-    } else {
-      val allBitExprs = sortedBits.map(_._1)
-      val wideWire = DefWire(NoInfo, s"${baseName}_wide", UIntType(IntWidth(numBits)))
-      val wideCat = catBits(allBitExprs.reverse)
-      val wideCon = Connect(NoInfo, WRef(wideWire), wideCat)
-
-      val foldedExpr = xorFoldAddr(WRef(wideWire), numBits, outWidth)
-      val hashWire = DefWire(NoInfo, s"${baseName}_hash", UIntType(IntWidth(outWidth)))
-      val hashCon = Connect(NoInfo, WRef(hashWire), foldedExpr)
-
-      (WRef(hashWire), Seq(wideWire, wideCon, hashWire, hashCon))
-    }
-  }
-
-  def defMemory(name: String, info: String, size: Int, addrWidth: Int): (DefMemory, WRef) = {
-    val mem = DefMemory(FileInfo(StringLit(info)), name,
-      UIntType(IntWidth(1)), size, 1, 0,
-      Seq("read"), Seq("write"), Seq())
-    val ref = WRef(name, BundleType(Seq(
-      Field("read", Flip, BundleType(List(
-        Field("addr", Default, UIntType(IntWidth(addrWidth))),
-        Field("en", Default, UIntType(IntWidth(1))),
-        Field("clk", Default, ClockType),
-        Field("data", Flip, UIntType(IntWidth(1)))
-      ))),
-      Field("write", Flip, BundleType(List(
-        Field("addr", Default, UIntType(IntWidth(addrWidth))),
-        Field("mask", Default, UIntType(IntWidth(1))),
-        Field("en", Default, UIntType(IntWidth(1))),
-        Field("clk", Default, ClockType),
-        Field("data", Default, UIntType(IntWidth(1)))
-      )))
-    )), MemKind, SourceFlow)
-
-    (mem, ref)
-  }
-
-  def xorFoldAddr(addr: Expression, addrWidth: Int, outWidth: Int): Expression = {
-    if (outWidth <= 0) return UIntLiteral(0, IntWidth(1))
-    if (addrWidth <= outWidth) return addr
-
-    val chunks = (0 until addrWidth by outWidth).map { lo =>
-      val hi = Math.min(addrWidth - 1, lo + outWidth - 1)
-      DoPrim(Bits, Seq(addr), Seq(hi, lo), UIntType(IntWidth(hi - lo + 1)))
-    }
-
-    chunks.reduce((a, b) => DoPrim(Xor, Seq(a, b), Seq(), UIntType(IntWidth(outWidth))))
-  }
-}
-
-class HierModuleInfoV9b(
-  val mName: String,
-  val insts: scala.collection.Set[WDefInstance],
-  val regs: scala.collection.Set[DefRegister],       // ALL regs — needed for metaReset
-  val ctrlRegs: scala.collection.Set[DefRegister],   // control regs only
-  val dirInRegs: scala.collection.Set[DefRegister],  // directly-input-fed control regs
-  val ctrlPortNames: Set[String]                     // port names feeding mux selects
-)
-
-object HierModuleInfoV9b {
-  def apply(mod: DefModule, gLedger: graphLedger): HierModuleInfoV9b = {
-    val insts = gLedger.getInstances
-    val regs = gLedger.findRegs
-    // Order matters: findMuxSrcs must run before findDirInRegs (populates reverseMap + ctrlSrcs)
-    val ctrlSrcs = gLedger.findMuxSrcs
-    val dirInRegs = gLedger.findDirInRegs
-    val ctrlRegs = ctrlSrcs("DefRegister").map(_.node.asInstanceOf[DefRegister]).toSet
-    val ctrlPortNames = ctrlSrcs("Port").map(_.name).toSet
-    new HierModuleInfoV9b(mod.name, insts, regs, ctrlRegs, dirInRegs, ctrlPortNames)
-  }
-}
-
-class InstrHierCovV9b(mod: DefModule,
-                      mInfo: HierModuleInfoV9b,
-                      extModules: Set[String],
-                      extModulePorts: scala.collection.Map[String, Seq[Port]],
-                      params: HierCovParamsV9b) {
-  import HierCovUtilV9b._
-
-  private val mName = mod.name
-
-  def instrument(): DefModule = {
-    mod match {
-      case m: Module =>
-        val stmts = m.body.asInstanceOf[Block].stmts
-        val (clockName, hasClockFound) = hasClock(m)
-
-        val inputBits = selectControlInputBits(m.ports, mInfo.ctrlPortNames, params)
-        val regBits = selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
-
-        val submodBits = mInfo.insts.filter(inst => !extModules.contains(inst.module)).flatMap { inst =>
-          val ref = WSubField(WRef(inst), "io_hierCovHash")
-          (0 until params.submodHashSize).map { idx =>
-            val bit = bitExtract(ref, idx, UIntType(IntWidth(params.submodHashSize)))
-            (bit, s"${inst.name}.io_hierCovHash[$idx]")
-          }
-        }.toSeq
-
-        // Proxy coverage for extmodule children: hash their input ports since
-        // we can't see inside them. Captures input-state variation as a proxy.
-        val extmodBits = mInfo.insts.filter(inst => extModules.contains(inst.module)).flatMap { inst =>
-          extModulePorts.getOrElse(inst.module, Seq.empty)
-            .filter(p => p.direction == Input)
-            .filter(p => p.tpe.isInstanceOf[UIntType] || p.tpe.isInstanceOf[SIntType])
-            .filterNot { p =>
-              val lname = p.name.toLowerCase
-              lname.contains("clock") || lname.contains("reset") || lname.contains("metareset")
-            }
-            .take(params.maxExtModPorts)
-            .flatMap { p =>
-              typeWidthOpt(p.tpe).toSeq.flatMap { width =>
-                val bitsToTake = Math.min(params.maxExtModBitsPerPort, width)
-                val stride = Math.max(1, width / bitsToTake)
-                (0 until width by stride).take(bitsToTake).map { idx =>
-                  val bit = bitExtract(WSubField(WRef(inst), p.name), idx, p.tpe)
-                  (bit, s"${inst.name}.${p.name}[$idx]")
-                }
-              }
-            }
-        }.toSeq
-
-        val coreBitsAll = regBits ++ submodBits ++ extmodBits
-
-        // v9b: use min(numBits, maxSize) directly — NOT log2ceil
-        var dynamicInputHashSize = if (inputBits.nonEmpty) {
-          val n = inputBits.size
-          if (n <= params.minHashSize) n
-          else Math.min(params.maxInputHashSize, n)  // min(n, cap) — NO log2
-        } else 0
-        var dynamicCoreHashSize = if (coreBitsAll.nonEmpty) {
-          val n = coreBitsAll.size
-          if (n <= params.minHashSize) n
-          else Math.min(params.maxCoreHashSize, n)   // min(n, cap) — NO log2
-        } else 0
-
-        // Apply maxAddrWidth cap
-        if (dynamicInputHashSize + dynamicCoreHashSize > params.maxAddrWidth) {
-          dynamicCoreHashSize = params.maxAddrWidth - dynamicInputHashSize
-          if (dynamicCoreHashSize < 0) {
-            dynamicInputHashSize = params.maxAddrWidth
-            dynamicCoreHashSize = 0
-          }
-        }
-
-        val (inputHash, inputHashStmts) = buildDirectOrFold(inputBits, dynamicInputHashSize, s"${mName}_in")
-        val (coreHash, coreHashStmts) = buildDirectOrFold(coreBitsAll, dynamicCoreHashSize, s"${mName}_core")
-
-        val addrWidth = dynamicInputHashSize + dynamicCoreHashSize
-        val addrExpr = DoPrim(Cat, Seq(inputHash, coreHash), Seq(), UIntType(IntWidth(addrWidth)))
-
-        val covSumPort = Port(NoInfo, "io_hierCovSum", Output, UIntType(IntWidth(params.covSumSize)))
-        val covHashPort = Port(NoInfo, "io_hierCovHash", Output, UIntType(IntWidth(params.submodHashSize)))
-
-        if (hasClockFound && addrWidth > 0) {
-          if (params.bucketCount < 2) {
-            throw new Exception("bucketCount must be >= 2")
-          }
-          val covMapSize = Math.pow(2, addrWidth).toInt
-          val (covMap, covRef) = defMemory(s"${mName}_hierCov", s"Hierarchical coverage map for ${mName}", covMapSize, addrWidth)
-          val covSum = DefRegister(NoInfo, s"${mName}_hierCovSum", UIntType(IntWidth(params.covSumSize)),
-            WRef(clockName, ClockType, PortKind, SourceFlow),
-            UIntLiteral(0, IntWidth(1)),
-            WRef(s"${mName}_hierCovSum", UIntType(IntWidth(params.covSumSize)), RegKind, UnknownFlow))
-
-          val bucketIdxWidth = log2Ceil(params.bucketCount)
-          if ((1 << bucketIdxWidth) != params.bucketCount) {
-            throw new Exception("bucketCount must be a power of 2")
-          }
-          val bucketRegs: Seq[DefRegister] = (0 until params.bucketCount).map { i =>
-            DefRegister(NoInfo, s"${mName}_covBucket_${i}", UIntType(IntWidth(params.bucketWidth)),
-              WRef(clockName, ClockType, PortKind, SourceFlow),
-              UIntLiteral(0, IntWidth(1)),
-              WRef(s"${mName}_covBucket_${i}", UIntType(IntWidth(params.bucketWidth)), RegKind, UnknownFlow))
-          }
-
-          val readSubField = WSubField(covRef, "read")
-          val writeSubField = WSubField(covRef, "write")
-
-          val rdAddr = Connect(NoInfo, WSubField(readSubField, "addr", UIntType(IntWidth(addrWidth)), SinkFlow), addrExpr)
-          val rdEn = Connect(NoInfo, WSubField(readSubField, "en", UIntType(IntWidth(1)), SinkFlow), UIntLiteral(1, IntWidth(1)))
-          val rdClk = Connect(NoInfo, WSubField(readSubField, "clk", ClockType, SinkFlow), WRef(clockName, ClockType, PortKind))
-
-          val wrAddr = Connect(NoInfo, WSubField(writeSubField, "addr", UIntType(IntWidth(addrWidth)), SinkFlow), addrExpr)
-          val wrMask = Connect(NoInfo, WSubField(writeSubField, "mask", UIntType(IntWidth(1)), SinkFlow), UIntLiteral(1, IntWidth(1)))
-          val wrEn = Connect(NoInfo, WSubField(writeSubField, "en", UIntType(IntWidth(1)), SinkFlow), UIntLiteral(1, IntWidth(1)))
-          val wrClk = Connect(NoInfo, WSubField(writeSubField, "clk", ClockType, SinkFlow), WRef(clockName, ClockType, PortKind))
-          val wrData = Connect(NoInfo, WSubField(writeSubField, "data", UIntType(IntWidth(1))), UIntLiteral(1, IntWidth(1)))
-
-          val readData = WSubField(readSubField, "data", UIntType(IntWidth(1)))
-          val newHit = DoPrim(Not, Seq(readData), Seq(), UIntType(IntWidth(1)))
-
-          val updateSum = Connect(NoInfo, WRef(covSum),
-            Mux(readData,
-              WRef(covSum),
-              DoPrim(Add, Seq(WRef(covSum), UIntLiteral(1, IntWidth(1))), Seq(), UIntType(IntWidth(params.covSumSize)))
-            ))
-
-          val bucketIdx = xorFoldAddr(addrExpr, addrWidth, bucketIdxWidth)
-          val bucketCons = bucketRegs.zipWithIndex.map { case (b, i) =>
-            val idxLit = UIntLiteral(i, IntWidth(bucketIdxWidth))
-            val isBucket = DoPrim(Eq, Seq(bucketIdx, idxLit), Seq(), UIntType(IntWidth(1)))
-            val inc = DoPrim(Add, Seq(WRef(b), UIntLiteral(1, IntWidth(1))), Seq(), UIntType(IntWidth(params.bucketWidth)))
-            val nextVal = Mux(newHit, Mux(isBucket, inc, WRef(b)), WRef(b))
-            Connect(NoInfo, WRef(b), nextVal)
-          }
-
-          val covSumCon = Connect(NoInfo, WRef(covSumPort), WRef(covSum))
-
-          val bucketBits = ListBuffer[(Expression, String)]()
-          for ((b, i) <- bucketRegs.zipWithIndex) {
-            val width = params.bucketWidth
-            val stride = Math.max(1, width / Math.min(width, 8))
-            val bitIdxs = (0 until width by stride)
-            for (idx <- bitIdxs) {
-              if (bucketBits.size >= params.maxBucketSigBits) {
-                // stop collecting
-              } else {
-                bucketBits.append((bitExtract(WRef(b), idx, UIntType(IntWidth(width))), s"${mName}_covBucket_${i}[$idx]"))
-              }
-            }
-          }
-
-          val (covHash, covHashStmts) = buildDirectOrFold(bucketBits.toSeq, params.submodHashSize, s"${mName}_covHash")
-          val covHashCon = Connect(NoInfo, WRef(covHashPort), covHash)
-
-          val ports = m.ports ++ Seq(covSumPort, covHashPort)
-          val newStmts = stmts ++ inputHashStmts ++ coreHashStmts ++ Seq(covMap, covSum) ++
-            bucketRegs ++ Seq(rdAddr, rdEn, rdClk, wrAddr, wrMask, wrEn, wrClk, wrData, updateSum) ++
-            bucketCons ++ Seq(covSumCon) ++ covHashStmts :+ covHashCon
-
-          Module(m.info, mName, ports, Block(newStmts))
-        } else {
-          val covSumWire = DefWire(NoInfo, s"${mName}_hierCovSum_wire", UIntType(IntWidth(params.covSumSize)))
-          val covHashWire = DefWire(NoInfo, s"${mName}_hierCovHash_wire", UIntType(IntWidth(params.submodHashSize)))
-          val covSumZero = Connect(NoInfo, WRef(covSumWire), UIntLiteral(0, IntWidth(params.covSumSize)))
-          val covHashZero = Connect(NoInfo, WRef(covHashWire), UIntLiteral(0, IntWidth(params.submodHashSize)))
-          val covSumCon = Connect(NoInfo, WRef(covSumPort), WRef(covSumWire))
-          val covHashCon = Connect(NoInfo, WRef(covHashPort), WRef(covHashWire))
-
-          val ports = m.ports ++ Seq(covSumPort, covHashPort)
-          val newStmts = stmts ++ Seq(covSumWire, covHashWire, covSumZero, covHashZero, covSumCon, covHashCon)
-          Module(m.info, mName, ports, Block(newStmts))
-        }
-
-      case ext: ExtModule => ext
-      case other => other
-    }
-  }
-}
-
-class InstrHierAssertV9b(mod: DefModule, mInfo: HierModuleInfoV9b) {
-  private val mName = mod.name
-  private val insts = mInfo.insts
-
-  def instrument(): DefModule = {
-    mod match {
-      case m: Module =>
-        val block = m.body
-        val stmts = block.asInstanceOf[Block].stmts
-        val (clockName, resetName, hasClockReset) = hasClockAndReset(m)
-
-        val assertPort = Port(NoInfo, "metaAssert", Output, UIntType(IntWidth(1)))
-
-        val stops = ListBuffer[Stop]()
-        findStop(stops)(block)
-
-        val stopEns = stops.zipWithIndex.map(tup => DefNode(NoInfo, s"stopEn${tup._2}", tup._1.en)).toSeq
-        val instAsserts = insts.map(inst =>
-          (inst, DefWire(NoInfo, s"${inst.name}_metaAssert_wire", UIntType(IntWidth(1))))).toSeq
-        val instAssertCons = instAsserts.map(tup =>
-          Connect(NoInfo, WRef(tup._2), WSubField(WRef(tup._1), "metaAssert"))
-        )
-
-        val (topOr, orStmts) =
-          makeOr(stopEns.map(en => WRef(en)) ++ instAsserts.map(tup => WRef(tup._2)), 0)
-
-        val conStmts = if (hasClockReset && topOr != None) {
-          val assertReg = DefRegister(NoInfo, s"${mName}_metaAssert", UIntType(IntWidth(1)),
-            WRef(clockName, ClockType, PortKind, SourceFlow),
-            UIntLiteral(0, IntWidth(1)),
-            WRef(s"${mName}_metaAssert", UIntType(IntWidth(1)), RegKind, UnknownFlow))
-          val or = DoPrim(Or, Seq(WRef(assertReg), topOr.get), Seq(), UIntType(IntWidth(1)))
-          val assertRegCon = Connect(NoInfo, WRef(assertReg), or)
-          val portCon = Connect(NoInfo, WRef(assertPort), WRef(assertReg))
-          Seq[Statement](assertReg, assertRegCon, portCon)
-        } else if (topOr != None) {
-          val portCon = Connect(NoInfo, WRef(assertPort), topOr.get)
-          Seq[Statement](portCon)
-        } else {
-          val portCon = Connect(NoInfo, WRef(assertPort), UIntLiteral(0))
-          Seq[Statement](portCon)
-        }
-
-        val ports = (m.ports :+ assertPort)
-        val newStmts = stmts ++ stopEns ++ instAsserts.map(tup => tup._2) ++ instAssertCons ++ orStmts ++ conStmts
-        val newBlock = Block(newStmts)
-        Module(m.info, mName, ports, newBlock)
-      case ext: ExtModule => ext
-      case other => other
-    }
-  }
-
-  def makeOr(stopEns: Seq[WRef], id: Int): (Option[WRef], Seq[Statement]) = {
-    stopEns.length match {
-      case 0 => (None, Seq[Statement]())
-      case 1 => (Some(stopEns.head), Seq[Statement]())
-      case 2 =>
-        val orWire = DefWire(NoInfo, mName + s"_or${id}", UIntType(IntWidth(1)))
-        val orOp = DoPrim(Or, stopEns, Seq(), UIntType(IntWidth(1)))
-        val orCon = Connect(NoInfo, WRef(orWire), orOp)
-        (Some(WRef(orWire)), Seq[Statement](orWire, orCon))
-      case _ =>
-        val (or1, stmts1) = makeOr(stopEns.splitAt(stopEns.length / 2)._1, 2 * id + 1)
-        val (or2, stmts2) = makeOr(stopEns.splitAt(stopEns.length / 2)._2, 2 * id + 2)
-        val orWire = DefWire(NoInfo, mName + s"_or${id}", UIntType(IntWidth(1)))
-        val orOp = DoPrim(Or, Seq(or1.get, or2.get), Seq(), UIntType(IntWidth(1)))
-        val orCon = Connect(NoInfo, WRef(orWire), orOp)
-        (Some(WRef(orWire)), stmts1 ++ stmts2 :+ orWire :+ orCon)
-    }
-  }
-
-  def findStop(stops: ListBuffer[Stop])(stmt: Statement): Unit = stmt match {
-    case stop: Stop => stops.append(stop)
-    case s: Statement => s foreachStmt findStop(stops)
-  }
-
-  def hasClockAndReset(mod: Module): (String, String, Boolean) = {
-    val ports = mod.ports
-    val (clockName, resetName) = ports.foldLeft[(String, String)](("None", "None"))(
-      (tuple, p) => {
-        if (p.name == "clock") (p.name, tuple._2)
-        else if (p.name contains "reset") (tuple._1, p.name)
-        else tuple
-      })
-    val hasClockAndReset = (clockName != "None") && (resetName != "None")
-    (clockName, resetName, hasClockAndReset)
-  }
-}
-
-class InstrHierResetV9b(mod: DefModule, mInfo: HierModuleInfoV9b, moduleInfos: scala.collection.Map[String, HierModuleInfoV9b]) {
-  private val mName = mod.name
-  private val insts = mInfo.insts
-  private val regs = mInfo.regs   // ALL regs — metaReset must reset every register
-
-  def instrument(): DefModule = {
-    mod match {
-      case m: Module =>
-        val stmts = m.body.asInstanceOf[Block].stmts
-        val metaResetPort = Port(NoInfo, "metaReset", Input, UIntType(IntWidth(1)))
-        val newStmts = stmts.map(addMetaReset(metaResetPort))
-
-        val resetCons = ListBuffer[Statement]()
-        val instResetPorts = ListBuffer[Port]()
-        val childInstHaltCons = ListBuffer[Statement]()
-        for (inst <- insts) {
-          val instResetPort = Port(NoInfo, inst.name + "_halt", Input, UIntType(IntWidth(1)))
-          val instReset = DoPrim(Or, Seq(WRef(metaResetPort), WRef(instResetPort)), Seq(), UIntType(IntWidth(1)))
-          val instResetCon = Connect(NoInfo, WSubField(WRef(inst), "metaReset"), instReset)
-
-          resetCons.append(instResetCon)
-          instResetPorts.append(instResetPort)
-
-          moduleInfos.get(inst.module).foreach { childInfo =>
-            for (childInst <- childInfo.insts) {
-              val haltRef = WSubField(WRef(inst), childInst.name + "_halt")
-              childInstHaltCons.append(Connect(NoInfo, haltRef, UIntLiteral(0, IntWidth(1))))
-            }
-          }
-        }
-
-        val ports = (m.ports :+ metaResetPort) ++ instResetPorts
-        val newBlock = Block(newStmts ++ resetCons ++ childInstHaltCons)
-
-        Module(m.info, mName, ports, newBlock)
-      case ext: ExtModule => ext
-      case other => other
-    }
-  }
-
-  def addMetaReset(metaReset: Port)(s: Statement): Statement = {
-    s match {
-      case Connect(info, loc, expr) if regs.exists(r => r.name == loc.serialize) =>
-        val reg = regs.find(r => r.name == loc.serialize).getOrElse(
-          throw new Exception(s"${loc.serialize} is not in registers")
-        )
-        reg.tpe match {
-          case utpe: UIntType =>
-            utpe.width match {
-              case w: IntWidth => Connect(info, loc, Mux(WRef(metaReset), UIntLiteral(0, IntWidth(w.width)), expr))
-              case _ => s
-            }
-          case stpe: SIntType =>
-            stpe.width match {
-              case w: IntWidth => Connect(info, loc, Mux(WRef(metaReset), SIntLiteral(0, IntWidth(w.width)), expr))
-              case _ => s
-            }
-          case _ => s
-        }
-      case other =>
-        other.mapStmt(addMetaReset(metaReset))
-    }
-  }
-}
-
 class hierCoverage_v9b extends Transform {
-  def inputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
+  def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
 
-  private val moduleInfos = mutable.Map[String, HierModuleInfoV9b]()
-  private val params = HierCovParamsV9b()
+  private val moduleInfos = mutable.Map[String, HierModuleInfo]()
+  // v9b knobs: wider input cap, 256 reg-bit budget, 32-way bucket histogram.
+  private val params = HierCovParams(
+    maxInputHashSize = 10,
+    maxCoreHashSize  = 14,
+    maxAddrWidth     = 20,
+    submodHashSize   = 16,
+    maxRegBits       = 256,
+    bucketCount      = 32,
+    maxBucketSigBits = 256
+  )
+  // ExtModule proxy knobs (not in HierCovParams since they're v9b-only).
+  private val maxExtModPorts       = 16
+  private val maxExtModBitsPerPort = 8
 
   def execute(state: CircuitState): CircuitState = {
     val circuit = state.circuit
@@ -589,113 +47,89 @@ class hierCoverage_v9b extends Transform {
     for (m <- circuit.modules) {
       val gLedger = new graphLedger(m)
       gLedger.parseModule
-      moduleInfos(m.name) = HierModuleInfoV9b(m, gLedger)
+      moduleInfos(m.name) = HierModuleInfo(m, gLedger)
     }
 
-    val extModules = circuit.modules.filter(_.isInstanceOf[ExtModule]).map(_.name).toSet
-    val extModulePorts = mutable.Map[String, Seq[Port]]()
-    for (m <- circuit.modules) m match {
-      case ext: ExtModule => extModulePorts(ext.name) = ext.ports
-      case _ =>
-    }
+    val extModules     = circuit.modules.filter(_.isInstanceOf[ExtModule]).map(_.name).toSet
+    val extModulePorts = HierCovSelectors.collectExtModulePorts(circuit)
 
     val instrCircuit = circuit map { m: DefModule =>
-      val instrCov = new InstrHierCovV9b(m, moduleInfos(m.name), extModules, extModulePorts, params)
-      instrCov.instrument()
+      val mInfo     = moduleInfos(m.name)
+      val ports     = m match { case mm: Module => mm.ports; case _ => Seq.empty[Port] }
+      val inputBits = HierCovSelectors.selectControlInputBits(ports, mInfo.ctrlPortNames, params)
+      val regBits   = HierCovSelectors.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
+      val proxyBits = HierCovSelectors.selectExtModuleProxyBits(
+        mInfo.insts, extModules, extModulePorts, maxExtModPorts, maxExtModBitsPerPort)
+      new InstrHierCov(
+        mod          = m,
+        mInfo        = mInfo,
+        extModules   = extModules,
+        params       = params,
+        inputBits    = inputBits,
+        regBits      = regBits,
+        hashFn       = HierCovHash.directOrFold,
+        extraCoreBits = proxyBits
+      ).instrument()
     }
 
     val assertCircuit = instrCircuit map { m: DefModule =>
-      val instrAssert = new InstrHierAssertV9b(m, moduleInfos(m.name))
-      instrAssert.instrument()
+      new InstrHierAssert(m, moduleInfos(m.name).insts).instrument()
     }
 
+    val moduleInstsMap: scala.collection.Map[String, scala.collection.Set[WDefInstance]] =
+      moduleInfos.map { case (k, v) => k -> v.insts }
+
     val metaResetCircuit = assertCircuit map { m: DefModule =>
-      val instrReset = new InstrHierResetV9b(m, moduleInfos(m.name), moduleInfos)
-      instrReset.instrument()
+      val mi = moduleInfos(m.name)
+      new InstrHierReset(m, mi.insts, mi.regs, moduleInstsMap).instrument()
     }
 
     writeCoverageSummary(circuit, extModules, extModulePorts, metaResetCircuit.main)
-
     state.copy(metaResetCircuit)
   }
 
-  private def writeCoverageSummary(circuit: Circuit, extModules: Set[String], extModulePorts: scala.collection.Map[String, Seq[Port]], topName: String): Unit = {
+  private def writeCoverageSummary(
+    circuit:        Circuit,
+    extModules:     Set[String],
+    extModulePorts: scala.collection.Map[String, Seq[Port]],
+    topName:        String
+  ): Unit = {
     val moduleMap = circuit.modules.map(m => m.name -> m).toMap
-    val moduleNums: Map[String, Int] = moduleInfos.map(tuple => {
-      (tuple._1, findModules(topName, tuple._1))
-    }).toMap
+    val moduleNums: Map[String, Int] = moduleInfos.map { t => (t._1, findModules(topName, t._1)) }.toMap
 
-    // v9b: use min(numBits, cap) directly — NO log2
-    def dynamicHash(n: Int, maxH: Int): Int = {
-      if (n <= 0) 0
-      else if (n <= params.minHashSize) n
-      else Math.min(maxH, n)
-    }
-
-    // v9b: apply maxAddrWidth cap to combined hash sizes
-    def clampAddrWidth(inputH: Int, coreH: Int): (Int, Int) = {
-      if (inputH + coreH <= params.maxAddrWidth) (inputH, coreH)
-      else {
-        val newCore = params.maxAddrWidth - inputH
-        if (newCore < 0) (params.maxAddrWidth, 0)
-        else (inputH, newCore)
-      }
-    }
-
-    def covMapSizeOf(moduleName: String): Long = {
-      moduleMap.get(moduleName) match {
-        case Some(m: Module) =>
-          val (_, hasClk) = HierCovUtilV9b.hasClock(m)
-          if (!hasClk) {
-            0L
-          } else {
-            val mInfo = moduleInfos(moduleName)
-            val inputBits = HierCovUtilV9b.selectControlInputBits(m.ports, mInfo.ctrlPortNames, params)
-            val regBits = HierCovUtilV9b.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
-            val submodInsts = mInfo.insts.count(inst => !extModules.contains(inst.module))
-            val extmodInsts = mInfo.insts.filter(inst => extModules.contains(inst.module))
-            val extmodBitCount = extmodInsts.foldLeft(0) { (acc, inst) =>
-              acc + extModulePorts.getOrElse(inst.module, Seq.empty)
-                .count(p => p.direction == Input && (p.tpe.isInstanceOf[UIntType] || p.tpe.isInstanceOf[SIntType]))
-                .min(params.maxExtModPorts) * params.maxExtModBitsPerPort
-            }
-            val inputHashEff = dynamicHash(inputBits.size, params.maxInputHashSize)
-            val coreBitCount = regBits.size + submodInsts * params.submodHashSize + extmodBitCount
-            val coreHashEff = dynamicHash(coreBitCount, params.maxCoreHashSize)
-            val (clampedInput, clampedCore) = clampAddrWidth(inputHashEff, coreHashEff)
-            val addrWidth = clampedInput + clampedCore
-            if (addrWidth > 0) (1L << addrWidth) else 0L
+    def covMapSizeOf(moduleName: String): Long = moduleMap.get(moduleName) match {
+      case Some(m: Module) =>
+        val (_, hasClk) = HierCovUtil.hasClock(m)
+        if (!hasClk) 0L
+        else {
+          val mInfo       = moduleInfos(moduleName)
+          val inputBits   = HierCovSelectors.selectControlInputBits(m.ports, mInfo.ctrlPortNames, params)
+          val regBits     = HierCovSelectors.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
+          val proxyBits   = HierCovSelectors.selectExtModuleProxyBits(
+            mInfo.insts, extModules, extModulePorts, maxExtModPorts, maxExtModBitsPerPort)
+          val submodInsts = mInfo.insts.count(inst => !extModules.contains(inst.module))
+          val ih          = if (inputBits.nonEmpty) Math.min(params.maxInputHashSize, inputBits.size) else 0
+          val coreBitCount = regBits.size + submodInsts * params.submodHashSize + proxyBits.size
+          val ch          = if (coreBitCount > 0) Math.min(params.maxCoreHashSize, coreBitCount) else 0
+          var dynIh = ih
+          var dynCh = ch
+          if (dynIh + dynCh > params.maxAddrWidth) {
+            dynCh = params.maxAddrWidth - dynIh
+            if (dynCh < 0) { dynIh = params.maxAddrWidth; dynCh = 0 }
           }
-        case _ => 0L
-      }
+          val addrWidth = dynIh + dynCh
+          if (addrWidth > 0) (1L << addrWidth) else 0L
+        }
+      case _ => 0L
     }
 
     val perModule = moduleInfos.keys.toSeq.sorted.map { mName =>
-      val covSize = covMapSizeOf(mName)
-      val instCnt = moduleNums.getOrElse(mName, 0)
-      val mInfo = moduleInfos(mName)
-      val ctrlRegCount = mInfo.ctrlRegs.size
+      val covSize       = covMapSizeOf(mName)
+      val instCnt       = moduleNums.getOrElse(mName, 0)
+      val mInfo         = moduleInfos(mName)
+      val ctrlRegCount  = mInfo.ctrlRegs.size
       val totalRegCount = mInfo.regs.size
-      // Compute dynamic hash sizes for summary reporting
-      val (inputHashH, coreHashH, extBitCount) = moduleMap.get(mName) match {
-        case Some(m: Module) =>
-          val inputBits = HierCovUtilV9b.selectControlInputBits(m.ports, mInfo.ctrlPortNames, params)
-          val regBits = HierCovUtilV9b.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
-          val submodInsts = mInfo.insts.count(inst => !extModules.contains(inst.module))
-          val extmodInsts = mInfo.insts.filter(inst => extModules.contains(inst.module))
-          val ebc = extmodInsts.foldLeft(0) { (acc, inst) =>
-            acc + extModulePorts.getOrElse(inst.module, Seq.empty)
-              .count(p => p.direction == Input && (p.tpe.isInstanceOf[UIntType] || p.tpe.isInstanceOf[SIntType]))
-              .min(params.maxExtModPorts) * params.maxExtModBitsPerPort
-          }
-          val ih = dynamicHash(inputBits.size, params.maxInputHashSize)
-          val coreBitCount = regBits.size + submodInsts * params.submodHashSize + ebc
-          val ch = dynamicHash(coreBitCount, params.maxCoreHashSize)
-          val (clampedIh, clampedCh) = clampAddrWidth(ih, ch)
-          (clampedIh, clampedCh, ebc)
-        case _ => (0, 0, 0)
-      }
-      s"  ${mName}: covMapSize=${covSize}, inputHash=${inputHashH}, coreHash=${coreHashH}, ctrlRegs=${ctrlRegCount}, totalRegs=${totalRegCount}, extProxyBits=${extBitCount}, instances=${instCnt}\n"
+      s"  ${mName}: covMapSize=${covSize}, ctrlRegs=${ctrlRegCount}, totalRegs=${totalRegCount}, instances=${instCnt}\n"
     }
     val totalCov = moduleInfos.keys.toSeq.foldLeft(0L) { (acc, mName) =>
       acc + covMapSizeOf(mName) * moduleNums.getOrElse(mName, 0).toLong
@@ -703,23 +137,19 @@ class hierCoverage_v9b extends Transform {
 
     val text =
       s"Top module: ${topName}\n" +
-      s"Total coverage points (hier_cov_v9b control-input): ${totalCov}\n" +
+      s"Total coverage points (hier_cov_v9b ctrl-input + extmod-proxy): ${totalCov}\n" +
       "Per-module coverage points:\n" +
       perModule.mkString("")
 
     val named = new PrintWriter(new File(s"${topName}_hier_cov_summary.txt"))
-    named.write(text)
-    named.close()
-
+    named.write(text); named.close()
     val compat = new PrintWriter(new File("summary.txt"))
-    compat.write(text)
-    compat.close()
+    compat.write(text); compat.close()
   }
 
-  private def findModules(topName: String, moduleName: String): Int = {
+  private def findModules(topName: String, moduleName: String): Int =
     if (topName == moduleName) 1
-    else {
-      moduleInfos.get(topName).map(_.insts.foldLeft(0)((num, inst) => num + findModules(inst.module, moduleName))).getOrElse(0)
-    }
-  }
+    else moduleInfos.get(topName)
+      .map(_.insts.foldLeft(0)((num, inst) => num + findModules(inst.module, moduleName)))
+      .getOrElse(0)
 }
