@@ -17,6 +17,7 @@
 // are wires/connects that the caller must include in the module body.
 package hier_cov.lib
 
+import firrtl2._         // WRef, etc.
 import firrtl2.ir._
 import HierCovUtil._
 

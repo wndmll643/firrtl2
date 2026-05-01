@@ -8,6 +8,7 @@
 // flavour.
 package hier_cov.lib
 
+import firrtl2._         // WDefInstance, etc.
 import firrtl2.ir._
 import coverage.graphLedger
 
