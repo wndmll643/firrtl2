@@ -22,7 +22,7 @@
 // performance refactors with bit-for-bit identical output (e.g. precomputed
 // caches) are acceptable, but only with a clearly-documented
 // "Verilog output unchanged" claim and ideally a regression test.
-package hier_cov
+package hier_cov.lib
 
 import firrtl2._
 import firrtl2.ir._

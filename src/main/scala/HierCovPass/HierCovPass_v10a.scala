@@ -25,6 +25,11 @@ import scala.collection.mutable
 
 import coverage.graphLedger
 
+// Refactored shared infrastructure lives in `hier_cov.lib` to avoid name
+// collisions with the legacy/v1 unsuffixed classes that share the parent
+// `hier_cov` package.
+import hier_cov.lib._
+
 class hierCoverage_v10a extends Transform {
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm

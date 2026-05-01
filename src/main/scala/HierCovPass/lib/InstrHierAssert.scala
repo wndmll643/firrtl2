@@ -10,7 +10,7 @@
 // Historically every variant declared `InstrHierAssertV6a`, `V6b`, `V9a`,
 // `V9b`, `V10a` with bit-for-bit identical bodies. This is the shared
 // implementation (DUP-1 in the checklist).
-package hier_cov
+package hier_cov.lib
 
 import firrtl2._
 import firrtl2.ir._

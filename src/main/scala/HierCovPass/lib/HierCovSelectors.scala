@@ -18,7 +18,7 @@
 // NEW function in this file (e.g. `selectControlRegBitsSorted`) and
 // consumed by a NEW variant (`v11a`, …). Never mutate an existing
 // function's behaviour just because it could be cleaner.
-package hier_cov
+package hier_cov.lib
 
 import firrtl2._
 import firrtl2.ir._

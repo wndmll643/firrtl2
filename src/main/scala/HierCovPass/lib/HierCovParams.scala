@@ -13,7 +13,7 @@
 //
 // See firrtl2/src/main/scala/HierCovPass/legacy/README.md for the full
 // historical parameter table.
-package hier_cov
+package hier_cov.lib
 
 case class HierCovParams(
   // Address-width budget per module. min(numBits, cap)-style sizing; total

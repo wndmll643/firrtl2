@@ -6,7 +6,7 @@
 // All fields are `scala.collection.Set` rather than `Set` to remain
 // compatible with the graphLedger API surface that returns the immutable
 // flavour.
-package hier_cov
+package hier_cov.lib
 
 import firrtl2.ir._
 import coverage.graphLedger

@@ -22,6 +22,9 @@ import scala.collection.mutable
 
 import coverage.graphLedger
 
+// Shared infra lives in `hier_cov.lib` (avoids collision with legacy/v1).
+import hier_cov.lib._
+
 class hierCoverage_v9a extends Transform {
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm

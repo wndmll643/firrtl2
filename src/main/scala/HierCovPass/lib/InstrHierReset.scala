@@ -14,7 +14,7 @@
 // `moduleInsts` maps each module-name to the set of WDefInstances *inside*
 // that module (used to drive grandchild halt ports). Pass the full
 // `moduleInfos` map's `_.insts` projection.
-package hier_cov
+package hier_cov.lib
 
 import firrtl2._
 import firrtl2.ir._

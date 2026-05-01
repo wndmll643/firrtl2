@@ -17,7 +17,7 @@
 // object must therefore be considered ABI-frozen for the variants that
 // already call them. To improve a function's output, add a NEW function
 // alongside the existing one and have a NEW variant call it.
-package hier_cov
+package hier_cov.lib
 
 import firrtl2._
 import firrtl2.ir._

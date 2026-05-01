@@ -19,6 +19,12 @@ import scala.collection.mutable
 
 import coverage.graphLedger
 
+// Shared infra (HierModuleInfo, HierCovParams, HierCovSelectors,
+// HierCovHash, InstrHierCov, InstrHierAssert, InstrHierReset) lives in
+// `hier_cov.lib` to avoid collisions with the unsuffixed legacy/v1
+// classes that share the parent `hier_cov` package.
+import hier_cov.lib._
+
 class hierCoverage_v6a extends Transform {
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
