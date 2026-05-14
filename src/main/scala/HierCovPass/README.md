@@ -26,6 +26,10 @@ Four variants are kept at the top level of this directory:
 | `hierCoverage_v6a` | DifuzzRTL-style data-input baseline; required by encarsia/hierfuzz Yosys flow for compatibility | `HierCovPass_v6a.scala` |
 | `hierCoverage_v6b` | Stable control-input reference; second-best TTB | `HierCovPass_v6b.scala` |
 | `hierCoverage_v9b` | Maximum coverage exploration on large designs (warning: slower TTB than v9a due to corpus bloat) | `HierCovPass_v9b.scala` |
+| `hierCoverage_v11a` | **Experimental** — v9a + tree-sum aggregation port (`io_hierCovSumTotal`). Harness reads the new port to see the union of unique-hit counts across the whole subtree, bypassing the lossy `io_hierCovHash` chain at the top. | `HierCovPass_v11a.scala` |
+| `hierCoverage_v11b` | **Experimental** — v6b + tree-sum aggregation port. bucketHash counterpart to v11a, paired so the new signal can be ablated against both baseline hashes. | `HierCovPass_v11b.scala` |
+| `hierCoverage_v12a` | **Experimental** — v11a + own-state hash addressing chain. Adds `io_hierCovHashOwn` (hash of own inputs+regs only) and parents read it instead of the bucket-histogram-driven `io_hierCovHash`, breaking the transitive descendant-activity leak in parent bitmaps. Tree-sum still gives deep coverage. | `HierCovPass_v12a.scala` |
+| `hierCoverage_v12b` | **Experimental** — v11b + own-state hash addressing chain. bucketHash counterpart to v12a. | `HierCovPass_v12b.scala` |
 
 Everything else is in `legacy/` — see the "Legacy variants" section below.
 

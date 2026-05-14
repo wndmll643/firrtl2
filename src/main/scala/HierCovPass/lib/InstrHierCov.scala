@@ -49,7 +49,30 @@ class InstrHierCov(
   // built-in submodule-hash bits. Used by v9b/v9d to fold an extmodule
   // input-port proxy into the parent's address (since extmodule internals are
   // invisible). Default empty for variants that don't proxy extmodules.
-  extraCoreBits: Seq[(Expression, String)] = Seq.empty
+  extraCoreBits: Seq[(Expression, String)] = Seq.empty,
+  // Opt-in tree-sum aggregation port. When true, every instrumented module
+  // also emits an `io_hierCovSumTotal` output equal to its own `covSum`
+  // plus every (non-extmodule) child's `io_hierCovSumTotal`. The harness
+  // can read the top-level value as the union of unique-hit counts across
+  // the whole subtree, bypassing the lossy `io_hierCovHash` chain.
+  // Default false → existing variants emit bit-identical Verilog. Used by
+  // v11a / v11b.
+  emitSumTotal:  Boolean = false,
+  // Opt-in own-state hash chain. When true:
+  //   (a) every module emits a new output port `io_hierCovHashOwn`
+  //       computed from `inputBits ++ regBits` only — no submodule hashes,
+  //       no bucket histogram, no bitmap-activity history;
+  //   (b) the parent's `submodBits` is built from the child's
+  //       `io_hierCovHashOwn` instead of the activity-history-based
+  //       `io_hierCovHash`.
+  // This breaks the transitive descendant leak inherent to the
+  // bucket-histogram-driven chain: a v12 parent's bitmap counts unique
+  // (parent_state, direct_child_state) pairs rather than
+  // (parent_state, recent-child-bitmap-fingerprint) pairs. The original
+  // `io_hierCovHash` port is left in place but unused (pruned by FIRRTL
+  // deadcode elimination on most modules). Default false → existing
+  // variants emit bit-identical Verilog. Used by v12a / v12b.
+  useOwnHashChain: Boolean = false
 ) {
   private val mName = mod.name
 
@@ -58,11 +81,15 @@ class InstrHierCov(
       val stmts                      = m.body.asInstanceOf[Block].stmts
       val (clockName, hasClockFound) = hasClock(m)
 
+      // v12 opt-in: parents read children's own-state hash port instead
+      // of the bucket-histogram-driven `io_hierCovHash`. Both ports have
+      // width `params.submodHashSize` so the bit-extraction is identical.
+      val childHashPortName = if (useOwnHashChain) "io_hierCovHashOwn" else "io_hierCovHash"
       val submodBits = mInfo.insts.filter(inst => !extModules.contains(inst.module)).flatMap { inst =>
-        val ref = WSubField(WRef(inst), "io_hierCovHash")
+        val ref = WSubField(WRef(inst), childHashPortName)
         (0 until params.submodHashSize).map { idx =>
           val bit = bitExtract(ref, idx, UIntType(IntWidth(params.submodHashSize)))
-          (bit, s"${inst.name}.io_hierCovHash[$idx]")
+          (bit, s"${inst.name}.${childHashPortName}[$idx]")
         }
       }.toSeq
 
@@ -163,10 +190,51 @@ class InstrHierCov(
         val (covHash, covHashStmts) = hashFn(bucketBits.toSeq, params.submodHashSize, s"${mName}_covHash")
         val covHashCon = Connect(NoInfo, WRef(covHashPort), covHash)
 
-        val ports = m.ports ++ Seq(covSumPort, covHashPort)
+        // Tree-sum aggregation (opt-in via `emitSumTotal`). Builds
+        //   io_hierCovSumTotal = (covSum + Σ child.io_hierCovSumTotal)[31:0]
+        // as a left-fold of `Add` primops with explicit width tracking
+        // (each Add of (w, covSumSize) yields a (max(w, covSumSize)+1)-bit
+        // result), then truncates to `covSumSize` bits via a `Bits` slice.
+        // Tracking widths explicitly avoids the FIRRTL PadWidths pass
+        // emitting a tower of redundant 1-bit zero-extensions when the
+        // declared Add result-type doesn't match its natural width.
+        // ExtModule children are skipped (they aren't instrumented and
+        // therefore lack the port) — same filter used for `submodBits`.
+        val (sumTotalPortSeq, sumTotalStmts): (Seq[Port], Seq[Statement]) = if (emitSumTotal) {
+          val sumTotalPort = Port(NoInfo, "io_hierCovSumTotal", Output, UIntType(IntWidth(params.covSumSize)))
+          val sumTotalTpe  = UIntType(IntWidth(params.covSumSize))
+          val childInsts   = mInfo.insts.filter(inst => !extModules.contains(inst.module)).toSeq
+          var acc: Expression = WRef(covSum)
+          var accWidth        = params.covSumSize
+          for (inst <- childInsts) {
+            val childRef = WSubField(WRef(inst), "io_hierCovSumTotal")
+            val newWidth = Math.max(accWidth, params.covSumSize) + 1
+            acc      = DoPrim(Add, Seq(acc, childRef), Seq(), UIntType(IntWidth(newWidth)))
+            accWidth = newWidth
+          }
+          val truncated = if (accWidth == params.covSumSize) acc
+                          else DoPrim(Bits, Seq(acc), Seq(params.covSumSize - 1, 0), sumTotalTpe)
+          val totalWire    = DefWire(NoInfo, s"${mName}_hierCovSumTotal_wire", sumTotalTpe)
+          val totalWireCon = Connect(NoInfo, WRef(totalWire), truncated)
+          val totalPortCon = Connect(NoInfo, WRef(sumTotalPort), WRef(totalWire))
+          (Seq(sumTotalPort), Seq(totalWire, totalWireCon, totalPortCon))
+        } else (Seq.empty, Seq.empty)
+
+        // Own-state hash port (opt-in via `useOwnHashChain`). Hashes only
+        // this module's own input + reg bits — no submodule hashes, no
+        // bucket histogram. Width matches `submodHashSize` so the parent's
+        // `submodBits` builder slots it in identically.
+        val (ownHashPortSeq, ownHashStmtsAll): (Seq[Port], Seq[Statement]) = if (useOwnHashChain) {
+          val ownHashPort = Port(NoInfo, "io_hierCovHashOwn", Output, UIntType(IntWidth(params.submodHashSize)))
+          val (ownHashExpr, ownHashStmts) = hashFn(inputBits ++ regBits, params.submodHashSize, s"${mName}_own")
+          val ownHashCon = Connect(NoInfo, WRef(ownHashPort), ownHashExpr)
+          (Seq(ownHashPort), ownHashStmts :+ ownHashCon)
+        } else (Seq.empty, Seq.empty)
+
+        val ports = m.ports ++ Seq(covSumPort, covHashPort) ++ sumTotalPortSeq ++ ownHashPortSeq
         val newStmts = stmts ++ inputHashStmts ++ coreHashStmts ++ Seq(covMap, covSum) ++
           bucketRegs ++ Seq(rdAddr, rdEn, rdClk, wrAddr, wrMask, wrEn, wrClk, wrData, updateSum) ++
-          bucketCons ++ Seq(covSumCon) ++ covHashStmts :+ covHashCon
+          bucketCons ++ Seq(covSumCon) ++ covHashStmts ++ Seq(covHashCon) ++ sumTotalStmts ++ ownHashStmtsAll
 
         Module(m.info, mName, ports, Block(newStmts))
       } else {
@@ -179,8 +247,28 @@ class InstrHierCov(
         val covSumCon   = Connect(NoInfo, WRef(covSumPort),  WRef(covSumWire))
         val covHashCon  = Connect(NoInfo, WRef(covHashPort), WRef(covHashWire))
 
-        val ports = m.ports ++ Seq(covSumPort, covHashPort)
-        val newStmts = stmts ++ Seq(covSumWire, covHashWire, covSumZero, covHashZero, covSumCon, covHashCon)
+        // Same opt-in port; zero-driven here (no per-module covSum to
+        // aggregate, and no children are reached through this branch —
+        // matches how covSum/covHash are zeroed above).
+        val (sumTotalPortSeq, sumTotalStmts): (Seq[Port], Seq[Statement]) = if (emitSumTotal) {
+          val sumTotalPort = Port(NoInfo, "io_hierCovSumTotal", Output, UIntType(IntWidth(params.covSumSize)))
+          val totalWire    = DefWire(NoInfo, s"${mName}_hierCovSumTotal_wire", UIntType(IntWidth(params.covSumSize)))
+          val totalZero    = Connect(NoInfo, WRef(totalWire), UIntLiteral(0, IntWidth(params.covSumSize)))
+          val totalPortCon = Connect(NoInfo, WRef(sumTotalPort), WRef(totalWire))
+          (Seq(sumTotalPort), Seq(totalWire, totalZero, totalPortCon))
+        } else (Seq.empty, Seq.empty)
+
+        // Same opt-in own-hash port; zero-driven here.
+        val (ownHashPortSeq, ownHashStmtsAll): (Seq[Port], Seq[Statement]) = if (useOwnHashChain) {
+          val ownHashPort = Port(NoInfo, "io_hierCovHashOwn", Output, UIntType(IntWidth(params.submodHashSize)))
+          val ownHashWire = DefWire(NoInfo, s"${mName}_hierCovHashOwn_wire", UIntType(IntWidth(params.submodHashSize)))
+          val ownHashZero = Connect(NoInfo, WRef(ownHashWire), UIntLiteral(0, IntWidth(params.submodHashSize)))
+          val ownHashCon  = Connect(NoInfo, WRef(ownHashPort), WRef(ownHashWire))
+          (Seq(ownHashPort), Seq(ownHashWire, ownHashZero, ownHashCon))
+        } else (Seq.empty, Seq.empty)
+
+        val ports = m.ports ++ Seq(covSumPort, covHashPort) ++ sumTotalPortSeq ++ ownHashPortSeq
+        val newStmts = stmts ++ Seq(covSumWire, covHashWire, covSumZero, covHashZero, covSumCon, covHashCon) ++ sumTotalStmts ++ ownHashStmtsAll
         Module(m.info, mName, ports, Block(newStmts))
       }
 
