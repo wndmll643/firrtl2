@@ -1,4 +1,4 @@
-// hier_cov.hierCoverage_v6a — DifuzzRTL-style data-input baseline.
+// hier_cov.hierCoverage_data_bucket — DifuzzRTL-style data-input baseline (was v6a).
 //
 // Selection : data input ports (non-control) + control regs (mux-source-derived)
 // Hashing   : bucket-XOR-reduce
@@ -25,14 +25,12 @@ import coverage.graphLedger
 // classes that share the parent `hier_cov` package.
 import hier_cov.lib._
 
-class hierCoverage_v6a extends Transform {
+class hierCoverage_data_bucket extends Transform {
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
 
   private val moduleInfos = mutable.Map[String, HierModuleInfo]()
-  // v6a-specific knobs: smaller hash widths than v9a, no maxAddrWidth ceiling.
-  // (Set maxAddrWidth larger than max(maxInputHashSize+maxCoreHashSize) so it
-  // never trips — preserves v6a's no-cap behaviour.)
+  // data_bucket knobs (smaller hash widths than ctrl_fold, no addr ceiling).
   private val params = HierCovParams(
     maxInputHashSize = 6,
     maxCoreHashSize  = 6,
@@ -111,7 +109,7 @@ class hierCoverage_v6a extends Transform {
 
     val text =
       s"Top module: ${topName}\n" +
-      s"Total coverage points (hier_cov_v6a data-input): ${totalCov}\n" +
+      s"Total coverage points (hier_cov data_bucket, data-input): ${totalCov}\n" +
       "Per-module coverage points:\n" +
       perModule.mkString("")
 

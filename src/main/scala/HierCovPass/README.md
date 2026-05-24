@@ -14,28 +14,32 @@ test-only state initialization.
 
 ## Recommended variants
 
-**Use `hierCoverage_v9a` unless you have a specific reason not to.** It is
-the fastest time-to-bug variant on every benchmark we've run, including
-beating DifuzzRTL register coverage on the hard micro_boom_720 LSU bug.
+**Use `hierCoverage_ctrl_fold` (was v9a) unless you have a specific reason
+not to.** It has the fastest time-to-bug on every benchmark we've run, beating
+DifuzzRTL register coverage on the hard micro_boom_720 LSU bug.
 
-Four variants are kept at the top level of this directory:
+Five variants are kept at the top level. Names follow the convention
+`<input-source>_<per-module-hash>[_tree]`:
 
-| Variant | When to use | File |
-|---|---|---|
-| **`hierCoverage_v9a`** | **Default — fastest TTB, recommended for all new work** | `HierCovPass_v9a.scala` |
-| `hierCoverage_v6a` | DifuzzRTL-style data-input baseline; required by encarsia/hierfuzz Yosys flow for compatibility | `HierCovPass_v6a.scala` |
-| `hierCoverage_v6b` | Stable control-input reference; second-best TTB | `HierCovPass_v6b.scala` |
-| `hierCoverage_v9b` | Maximum coverage exploration on large designs (warning: slower TTB than v9a due to corpus bloat) | `HierCovPass_v9b.scala` |
-| `hierCoverage_v11a` | **Experimental** — v9a + tree-sum aggregation port (`io_hierCovSumTotal`). Harness reads the new port to see the union of unique-hit counts across the whole subtree, bypassing the lossy `io_hierCovHash` chain at the top. | `HierCovPass_v11a.scala` |
-| `hierCoverage_v11b` | **Experimental** — v6b + tree-sum aggregation port. bucketHash counterpart to v11a, paired so the new signal can be ablated against both baseline hashes. | `HierCovPass_v11b.scala` |
-| `hierCoverage_v12a` | **Experimental** — v11a + own-state hash addressing chain. Adds `io_hierCovHashOwn` (hash of own inputs+regs only) and parents read it instead of the bucket-histogram-driven `io_hierCovHash`, breaking the transitive descendant-activity leak in parent bitmaps. Tree-sum still gives deep coverage. | `HierCovPass_v12a.scala` |
-| `hierCoverage_v12b` | **Experimental** — v11b + own-state hash addressing chain. bucketHash counterpart to v12a. | `HierCovPass_v12b.scala` |
+- input-source: `data` (data-bearing input ports) or `ctrl` (control-bearing)
+- per-module-hash: `bucket` (XOR-reduce per bucket) or `fold` (direct-or-fold)
+- `_tree` suffix: also emit `io_hierCovSumTotal` (lossless tree-sum aggregation)
+
+| Variant | Input | Per-module hash | Tree-sum | Was | File |
+|---|---|---|---|---|---|
+| **`hierCoverage_ctrl_fold`** | control | direct-or-fold | — | v9a | `HierCovPass_ctrl_fold.scala` |
+| `hierCoverage_data_bucket` | data | bucket-XOR | — | v6a | `HierCovPass_data_bucket.scala` |
+| `hierCoverage_ctrl_bucket` | control | bucket-XOR | — | v6b | `HierCovPass_ctrl_bucket.scala` |
+| `hierCoverage_ctrl_bucket_tree` | control | bucket-XOR | yes | v11b | `HierCovPass_ctrl_bucket_tree.scala` |
+| `hierCoverage_data_bucket_tree` | data | bucket-XOR | yes | new (v11c) | `HierCovPass_data_bucket_tree.scala` |
 
 Everything else is in `legacy/` — see the "Legacy variants" section below.
+Notable moves to legacy in this rename: `v9b`, `v10a`, `v11a`, `v12a`, `v12b`
+(all still addressable as `-fct hier_cov.hierCoverage_<v-name>`).
 
-### Why v9a wins
+### Why ctrl_fold (v9a) wins
 
-v9a's advantage comes from three design choices working together:
+ctrl_fold's advantage comes from three design choices working together:
 
 1. **Direct concatenation eliminates hashing collisions.** Older variants
    (v1–v8) use a bucket XOR-reduce hash that collapses each bucket of N bits

@@ -1,16 +1,18 @@
-// hier_cov.hierCoverage_v11b — v6b + tree-sum aggregation port.
+// hier_cov.hierCoverage_data_bucket_tree — data-input version of
+// ctrl_bucket_tree (was v11b). Same instrumentation strategy as v6a
+// (data-input + bucket-XOR-reduce) plus the v11-family tree-sum
+// aggregation port `io_hierCovSumTotal`.
 //
-// Selection : control input ports (mux-source) + control regs   — same as v6b
-// Hashing   : bucket-XOR-reduce                                  — same as v6b
-// Sizing    : min(numBits, cap), maxAddrWidth=12                 — same as v6b
-// Hash pipe : 6-bit io_hierCovHash to parents                    — same as v6b
-// New       : `io_hierCovSumTotal` output port at every module —
-//             see HierCovPass_v11a.scala for the rationale.
-//
-// v11b is the bucketHash counterpart to v11a (which is the directOrFold
-// counterpart to v9a). Pairing both lets us ablate the tree-sum signal
-// independently against each baseline hashing strategy. v6b's emitted
-// Verilog is preserved verbatim (it never sets `emitSumTotal`).
+// Selection : DATA input ports (mux-source-excluded) + control regs
+// Hashing   : bucket-XOR-reduce
+// Sizing    : min(numBits, cap), maxAddrWidth=12
+// Hash pipe : 6-bit io_hierCovHash to parents
+// Tree-sum  : `io_hierCovSumTotal` output port at every module,
+//             recursively summing this module's `covSum` with every
+//             non-extmodule child's `io_hierCovSumTotal`. The harness
+//             can read the top-level value to get the union of unique
+//             coverage hits across the whole subtree, bypassing the
+//             lossy `io_hierCovHash` chain.
 package hier_cov
 
 import java.io.{File, PrintWriter}
@@ -23,10 +25,9 @@ import scala.collection.mutable
 
 import coverage.graphLedger
 
-// Shared infra lives in `hier_cov.lib` (avoids collision with legacy/v1).
 import hier_cov.lib._
 
-class hierCoverage_v11b extends Transform {
+class hierCoverage_data_bucket_tree extends Transform {
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
 
@@ -52,7 +53,7 @@ class hierCoverage_v11b extends Transform {
     val instrCircuit = circuit map { m: DefModule =>
       val mInfo     = moduleInfos(m.name)
       val ports     = m match { case mm: Module => mm.ports; case _ => Seq.empty[Port] }
-      val inputBits = HierCovSelectors.selectControlInputBits(ports, mInfo.ctrlPortNames, params)
+      val inputBits = HierCovSelectors.selectDataInputBits(ports, mInfo.ctrlPortNames, params)
       val regBits   = HierCovSelectors.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
       new InstrHierCov(
         m, mInfo, extModules, params,
@@ -87,7 +88,7 @@ class hierCoverage_v11b extends Transform {
         if (!hasClk) 0L
         else {
           val mInfo       = moduleInfos(moduleName)
-          val inputBits   = HierCovSelectors.selectControlInputBits(m.ports, mInfo.ctrlPortNames, params)
+          val inputBits   = HierCovSelectors.selectDataInputBits(m.ports, mInfo.ctrlPortNames, params)
           val regBits     = HierCovSelectors.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
           val submodInsts = mInfo.insts.count(inst => !extModules.contains(inst.module))
           val ih          = if (inputBits.nonEmpty) Math.min(params.maxInputHashSize, inputBits.size) else 0
@@ -113,7 +114,7 @@ class hierCoverage_v11b extends Transform {
 
     val text =
       s"Top module: ${topName}\n" +
-      s"Total coverage points (hier_cov_v11b ctrl-input, tree-sum): ${totalCov}\n" +
+      s"Total coverage points (hier_cov data_bucket_tree, data-input, tree-sum): ${totalCov}\n" +
       "Per-module coverage points:\n" +
       perModule.mkString("")
 

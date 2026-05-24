@@ -1,4 +1,4 @@
-// hier_cov.hierCoverage_v6b — control-input-only baseline.
+// hier_cov.hierCoverage_ctrl_bucket — control-input-only baseline (was v6b).
 //
 // Selection : control input ports (mux-source) + control regs
 // Hashing   : bucket-XOR-reduce
@@ -22,7 +22,7 @@ import coverage.graphLedger
 // Shared infra lives in `hier_cov.lib` (avoids collision with legacy/v1).
 import hier_cov.lib._
 
-class hierCoverage_v6b extends Transform {
+class hierCoverage_ctrl_bucket extends Transform {
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
 
@@ -105,7 +105,7 @@ class hierCoverage_v6b extends Transform {
 
     val text =
       s"Top module: ${topName}\n" +
-      s"Total coverage points (hier_cov_v6b ctrl-input): ${totalCov}\n" +
+      s"Total coverage points (hier_cov ctrl_bucket, ctrl-input): ${totalCov}\n" +
       "Per-module coverage points:\n" +
       perModule.mkString("")
 
