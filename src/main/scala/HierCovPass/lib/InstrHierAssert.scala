@@ -89,16 +89,22 @@ class InstrHierAssert(mod: DefModule, insts: scala.collection.Set[WDefInstance])
   }
 
   /** Locate the conventional clock + reset port pair on this module. Returns
-    * ("None", "None", false) if either is missing. Same heuristic as the
-    * historical per-variant copies (V9-11 in the checklist — fragile against
-    * `gated_clock`, `rst_n`, `aresetn`, but kept identical for now). */
+    * ("None", "None", false) if either is missing.
+    *
+    * Prefers canonical names but falls back to any input Clock port and any
+    * port whose name contains "reset". Without the fallback, modern chipyard
+    * wrappers (ChipTop / DigitalTop) — which use diplomatic clock names like
+    * `clock_uncore`, `debug_clock` — never get metaAssert wired, breaking
+    * the cross-domain assert propagation chain. Same rationale as
+    * `HierCovUtil.hasClock`. */
   private def hasClockAndReset(mod: Module): (String, String, Boolean) = {
     val ports = mod.ports
-    val (clockName, resetName) = ports.foldLeft[(String, String)](("None", "None")) { (tuple, p) =>
-      if (p.name == "clock") (p.name, tuple._2)
-      else if (p.name contains "reset") (tuple._1, p.name)
-      else tuple
-    }
-    (clockName, resetName, (clockName != "None") && (resetName != "None"))
+    val preferredClock = ports.find(p => p.name == "clock")
+    val anyClock = ports.find(p => p.direction == Input && p.tpe == ClockType)
+    val clockPort = preferredClock.orElse(anyClock)
+    val resetPort = ports.find(p => p.name contains "reset")
+    val clockName = clockPort.map(_.name).getOrElse("None")
+    val resetName = resetPort.map(_.name).getOrElse("None")
+    (clockName, resetName, clockPort.isDefined && resetPort.isDefined)
   }
 }

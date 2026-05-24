@@ -36,14 +36,28 @@ object HierCovUtil {
   def stableHash64(s: String): Long =
     s.foldLeft(0L)((h, c) => (h * 31L + c.toLong) & 0x7fffffffffffffffL)
 
-  /** Find the canonical clock port name. Returns ("None", false) if absent.
-    * Recognises `clock`, `gated_clock`, `clk`. Does not handle async/multi-clock
-    * designs — those would need explicit annotations. */
+  /** Find a usable clock port name. Returns ("None", false) if absent.
+    *
+    * Prefers canonical names (`clock`, `gated_clock`, `clk`) for backward
+    * compatibility with legacy FIRRTL where the convention is universal.
+    * Falls back to ANY input port of type Clock when no canonical name is
+    * present — this covers modern chipyard wrappers (`ChipTop`, `DigitalTop`)
+    * that pass diplomatic clocks under names like `clock_uncore`,
+    * `debug_clock`, `serial_tl_0_clock_in`. Without the fallback, those
+    * wrappers hit the no-clock else-branch in InstrHierCov, which hardcodes
+    * `io_hierCovHash = 0` and lets firrtl2's constant-propagation strip the
+    * entire BOOM coverage chain below them.
+    *
+    * Does not handle async/multi-clock designs — those would need explicit
+    * annotations. When multiple input Clock ports exist and none is
+    * canonical, we pick the first one declared. */
   def hasClock(mod: Module): (String, Boolean) = {
-    val clockName = mod.ports
+    val preferred = mod.ports
       .find(p => p.name == "clock" || p.name == "gated_clock" || p.name == "clk")
-      .map(_.name)
-    (clockName.getOrElse("None"), clockName.isDefined)
+    val anyInputClock = mod.ports
+      .find(p => p.direction == Input && p.tpe == ClockType)
+    val chosen = preferred.orElse(anyInputClock)
+    (chosen.map(_.name).getOrElse("None"), chosen.isDefined)
   }
 
   /** Width of a UInt or SInt type, or None for clocks/aggregates. */
