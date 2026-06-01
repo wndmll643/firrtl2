@@ -1,8 +1,14 @@
 # HierCovPass — Legacy variants
 
 This directory contains older or experimental hierarchical-coverage passes that
-have been superseded by the variants kept at the parent directory's top level
-(`v6a`, `v6b`, `v9a`, `v9b`).
+have been superseded by the variants kept at the parent directory's top level.
+The current main set (in parent directory) is:
+
+- `data_bucket` (was `v6a`) — data-input + bucket-XOR
+- `ctrl_bucket` (was `v6b`) — control-input + bucket-XOR
+- `ctrl_fold` (was `v9a`) — control-input + direct-or-fold
+- `ctrl_bucket_tree` (was `v11b`) — control-input + bucket-XOR + tree-sum
+- `data_bucket_tree` (was `v11c`, new) — data-input + bucket-XOR + tree-sum
 
 These passes still compile and remain addressable as
 `-fct hier_cov.hierCoverage_<name>` — Scala uses package declarations rather
@@ -28,6 +34,11 @@ For the recommended variants and current results, see
 | v8b | v8a with control-input selection. Marginally better than v6b, still dominated by v9 |
 | v9c | XOR-fold hash (no direct-concat path), v6b-style sizing. Dominated by v9a |
 | v9d | XOR-fold hash, v7b-style dynamic sizing. Similar to v7b, superseded by v9b |
+| v9b | v9a + extmodule-proxy + wider sizing. Marginal gains; preserved for ablation. Now in `legacy/` because `ctrl_fold` (was v9a) is the recommended default. |
+| v10a | Intermediate experiment. Superseded by v11 family with tree-sum. |
+| v11a | v9a + tree-sum aggregation port (`io_hierCovSumTotal`). Superseded by `ctrl_bucket_tree` (was v11b), which uses simpler bucketed per-module hashing while still adding tree-sum. |
+| v12a | v11a + own-state hash chain (eliminates transitive descendant leak in parent hash). Experimental, not currently in main set. |
+| v12b | v11b + own-state hash chain. Experimental, not currently in main set. |
 
 ## Files in this directory
 
@@ -47,6 +58,11 @@ HierCovPass_v8a.scala        hierCoverage_v8a
 HierCovPass_v8b.scala        hierCoverage_v8b
 HierCovPass_v9c.scala        hierCoverage_v9c
 HierCovPass_v9d.scala        hierCoverage_v9d
+HierCovPass_v9b.scala        hierCoverage_v9b
+HierCovPass_v10a.scala       hierCoverage_v10a
+HierCovPass_v11a.scala       hierCoverage_v11a
+HierCovPass_v12a.scala       hierCoverage_v12a
+HierCovPass_v12b.scala       hierCoverage_v12b
 ```
 
 ## Detailed history
