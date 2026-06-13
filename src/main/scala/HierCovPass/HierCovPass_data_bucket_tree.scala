@@ -28,6 +28,12 @@ import coverage.graphLedger
 import hier_cov.lib._
 
 class hierCoverage_data_bucket_tree extends Transform {
+  // Legacy `inputForm` field — modern firrtl2 ignores it. Callers must
+  // feed a LowForm IR (e.g. via the two-step lower→patch→instrument
+  // pipeline in verilog_gen.py). We attempted `prerequisites = LowForm`
+  // here but the DependencyManager then re-runs lowering passes AFTER
+  // hier_cov, which strips the metaReset connections we just added on
+  // extmodule instances → CheckInitialization fails with VOID drivers.
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
 
@@ -75,6 +81,8 @@ class hierCoverage_data_bucket_tree extends Transform {
     }
 
     writeCoverageSummary(circuit, extModules, metaResetCircuit.main)
+    // Opt-in (env-var gated) JSON manifest — see BucketManifest.scala.
+    BucketManifest.maybeEmit(metaResetCircuit, metaResetCircuit.main, moduleInfos, "data_bucket_tree")
     state.copy(metaResetCircuit)
   }
 

@@ -81,6 +81,10 @@ class hierCoverage_data_bucket extends Transform {
     }
 
     writeCoverageSummary(circuit, extModules, metaResetCircuit.main)
+    // Opt-in (env-var gated) JSON manifest of per-instance covmap depths,
+    // consumed by the bitmap-mode fuzzer to walk cocotb hierarchy and read
+    // each module's `_hierCov` memory. No Verilog change either way.
+    BucketManifest.maybeEmit(metaResetCircuit, metaResetCircuit.main, moduleInfos, "data_bucket")
     state.copy(metaResetCircuit)
   }
 

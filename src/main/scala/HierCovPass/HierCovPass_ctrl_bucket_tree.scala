@@ -23,6 +23,7 @@ import coverage.graphLedger
 import hier_cov.lib._
 
 class hierCoverage_ctrl_bucket_tree extends Transform {
+  // See HierCovPass_data_bucket_tree for why we kept legacy `inputForm`.
   def inputForm:  firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
   def outputForm: firrtl2.stage.Forms.LowForm.type = firrtl2.stage.Forms.LowForm
 
@@ -70,6 +71,8 @@ class hierCoverage_ctrl_bucket_tree extends Transform {
     }
 
     writeCoverageSummary(circuit, extModules, metaResetCircuit.main)
+    // Opt-in (env-var gated) JSON manifest — see BucketManifest.scala.
+    BucketManifest.maybeEmit(metaResetCircuit, metaResetCircuit.main, moduleInfos, "ctrl_bucket_tree")
     state.copy(metaResetCircuit)
   }
 

@@ -33,12 +33,17 @@ object HierCovSelectors {
     * at a stride of `width / bitsToTake`. */
   private def sampleBitsOfPort(p: Port, params: HierCovParams): Seq[(Expression, String)] = {
     typeWidthOpt(p.tpe).toSeq.flatMap { width =>
-      val bitsToTake = Math.min(params.maxBitsPerPort, width)
-      val stride     = Math.max(1, width / bitsToTake)
-      val bitIdxs    = (0 until width by stride).take(bitsToTake)
-      bitIdxs.map { idx =>
-        val bit = bitExtract(WRef(p), idx, p.tpe)
-        (bit, s"${p.name}[$idx]")
+      // V4 has 0-width ports (V3 did not). Skip them — width=0 makes
+      // bitsToTake=0 and the stride computation divides by zero.
+      if (width <= 0) Seq.empty
+      else {
+        val bitsToTake = Math.min(params.maxBitsPerPort, width)
+        val stride     = Math.max(1, width / bitsToTake)
+        val bitIdxs    = (0 until width by stride).take(bitsToTake)
+        bitIdxs.map { idx =>
+          val bit = bitExtract(WRef(p), idx, p.tpe)
+          (bit, s"${p.name}[$idx]")
+        }
       }
     }
   }
@@ -106,10 +111,14 @@ object HierCovSelectors {
     val bits = ListBuffer[(Expression, String)]()
     for (reg <- regs if bits.size < params.maxRegBits) {
       typeWidthOpt(reg.tpe).foreach { width =>
-        val stride  = Math.max(1, width / Math.min(width, 8))
-        val bitIdxs = (0 until width by stride)
-        for (idx <- bitIdxs if bits.size < params.maxRegBits) {
-          bits.append((bitExtract(WRef(reg), idx, reg.tpe), s"${reg.name}[$idx]"))
+        // V4 has 0-width registers (V3 did not). Skip them — the original
+        // `width / Math.min(width, 8)` divides by zero when width == 0.
+        if (width > 0) {
+          val stride  = Math.max(1, width / Math.min(width, 8))
+          val bitIdxs = (0 until width by stride)
+          for (idx <- bitIdxs if bits.size < params.maxRegBits) {
+            bits.append((bitExtract(WRef(reg), idx, reg.tpe), s"${reg.name}[$idx]"))
+          }
         }
       }
     }
@@ -143,11 +152,15 @@ object HierCovSelectors {
         .take(maxPorts)
         .flatMap { p =>
           typeWidthOpt(p.tpe).toSeq.flatMap { width =>
-            val bitsToTake = Math.min(maxBitsPerPort, width)
-            val stride     = Math.max(1, width / bitsToTake)
-            (0 until width by stride).take(bitsToTake).map { idx =>
-              val bit = bitExtract(WSubField(WRef(inst), p.name), idx, p.tpe)
-              (bit, s"${inst.name}.${p.name}[$idx]")
+            // Skip 0-width ports — V4 has them, V3 didn't (divide by zero).
+            if (width <= 0) Seq.empty
+            else {
+              val bitsToTake = Math.min(maxBitsPerPort, width)
+              val stride     = Math.max(1, width / bitsToTake)
+              (0 until width by stride).take(bitsToTake).map { idx =>
+                val bit = bitExtract(WSubField(WRef(inst), p.name), idx, p.tpe)
+                (bit, s"${inst.name}.${p.name}[$idx]")
+              }
             }
           }
         }

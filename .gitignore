@@ -68,3 +68,8 @@ project/metals.sbt
 *~
 *#*#
 .vscode
+
+TestHarness_*_buckets.json
+TestHarness_hier_cov_summary.txt
+summary.txt
+*.jar.before_*
