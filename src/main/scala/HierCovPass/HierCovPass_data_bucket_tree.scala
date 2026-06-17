@@ -82,7 +82,18 @@ class hierCoverage_data_bucket_tree extends Transform {
 
     writeCoverageSummary(circuit, extModules, metaResetCircuit.main)
     // Opt-in (env-var gated) JSON manifest — see BucketManifest.scala.
-    BucketManifest.maybeEmit(metaResetCircuit, metaResetCircuit.main, moduleInfos, "data_bucket_tree")
+    val moduleMapForSignals = circuit.modules.map(m => m.name -> m).toMap
+    BucketManifest.maybeEmitWithSignals(
+      metaResetCircuit, metaResetCircuit.main, moduleInfos, "data_bucket_tree",
+      (mName: String) => moduleMapForSignals.get(mName) match {
+        case Some(m: Module) =>
+          val mInfo     = moduleInfos(mName)
+          val inputBits = HierCovSelectors.selectDataInputBits(m.ports, mInfo.ctrlPortNames, params)
+          val regBits   = HierCovSelectors.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
+          (inputBits.map(_._2), regBits.map(_._2))
+        case _ => (Seq.empty[String], Seq.empty[String])
+      }
+    )
     state.copy(metaResetCircuit)
   }
 

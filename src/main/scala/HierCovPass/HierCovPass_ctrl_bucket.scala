@@ -66,6 +66,19 @@ class hierCoverage_ctrl_bucket extends Transform {
     }
 
     writeCoverageSummary(circuit, extModules, metaResetCircuit.main)
+    // Opt-in (env-var gated) JSON manifest — see BucketManifest.scala.
+    val moduleMapForSignals = circuit.modules.map(m => m.name -> m).toMap
+    BucketManifest.maybeEmitWithSignals(
+      metaResetCircuit, metaResetCircuit.main, moduleInfos, "ctrl_bucket",
+      (mName: String) => moduleMapForSignals.get(mName) match {
+        case Some(m: Module) =>
+          val mInfo     = moduleInfos(mName)
+          val inputBits = HierCovSelectors.selectControlInputBits(m.ports, mInfo.ctrlPortNames, params)
+          val regBits   = HierCovSelectors.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
+          (inputBits.map(_._2), regBits.map(_._2))
+        case _ => (Seq.empty[String], Seq.empty[String])
+      }
+    )
     state.copy(metaResetCircuit)
   }
 

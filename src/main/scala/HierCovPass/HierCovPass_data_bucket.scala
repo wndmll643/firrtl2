@@ -84,7 +84,21 @@ class hierCoverage_data_bucket extends Transform {
     // Opt-in (env-var gated) JSON manifest of per-instance covmap depths,
     // consumed by the bitmap-mode fuzzer to walk cocotb hierarchy and read
     // each module's `_hierCov` memory. No Verilog change either way.
-    BucketManifest.maybeEmit(metaResetCircuit, metaResetCircuit.main, moduleInfos, "data_bucket")
+    // maybeEmitWithSignals additionally embeds per-instance input/reg
+    // signal name lists and writes a per-bucket-index expansion file —
+    // see BucketManifest.scala. Still gated on HIERCOV_EMIT_MANIFEST=1.
+    val moduleMapForSignals = circuit.modules.map(m => m.name -> m).toMap
+    BucketManifest.maybeEmitWithSignals(
+      metaResetCircuit, metaResetCircuit.main, moduleInfos, "data_bucket",
+      (mName: String) => moduleMapForSignals.get(mName) match {
+        case Some(m: Module) =>
+          val mInfo     = moduleInfos(mName)
+          val inputBits = HierCovSelectors.selectDataInputBits(m.ports, mInfo.ctrlPortNames, params)
+          val regBits   = HierCovSelectors.selectControlRegBits(mInfo.ctrlRegs, mInfo.dirInRegs, params)
+          (inputBits.map(_._2), regBits.map(_._2))
+        case _ => (Seq.empty[String], Seq.empty[String])
+      }
+    )
     state.copy(metaResetCircuit)
   }
 
