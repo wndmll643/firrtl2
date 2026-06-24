@@ -125,6 +125,83 @@ object HierCovSelectors {
     bits.toSeq
   }
 
+  // ===========================================================================
+  // SORTED-MODE SELECTORS — Gate 3 CIRCT-port validation track.
+  //
+  // Identical to the production selectors above except candidate
+  // ports/regs are sorted alphabetically by name BEFORE the `maxInputPorts` /
+  // `maxRegBits` cap binds. This makes selection FULLY deterministic and
+  // language-independent (Scala `Set` HashSet-bucket-order is otherwise
+  // implementation-defined and differs from CIRCT's vector-iteration order),
+  // unlocking bit-strict bucket-address equivalence on shared modules.
+  //
+  // Consumed only by the `*_sorted` variants (e.g. ctrl_bucket_tree_sorted).
+  // Production variants continue to use the unsorted selectors above per
+  // the IMMUTABILITY rule.
+  // ===========================================================================
+
+  def selectControlInputBitsSorted(
+    ports:         Seq[Port],
+    ctrlPortNames: Set[String],
+    params:        HierCovParams
+  ): Seq[(Expression, String)] = {
+    val ctrlInputs = ports
+      .filter(p => p.direction == Input)
+      .filterNot { p =>
+        val lname = p.name.toLowerCase
+        p.tpe == ClockType || lname.contains("clock") || lname.contains("reset")
+      }
+      .filter(p => p.tpe.isInstanceOf[UIntType] || p.tpe.isInstanceOf[SIntType])
+      .filter(p => ctrlPortNames.contains(p.name))
+      .sortBy(_.name)  // <-- the only change vs production version
+    ctrlInputs.take(params.maxInputPorts).flatMap(p => sampleBitsOfPort(p, params))
+  }
+
+  def selectDataInputBitsSorted(
+    ports:         Seq[Port],
+    ctrlPortNames: Set[String],
+    params:        HierCovParams
+  ): Seq[(Expression, String)] = {
+    val dataInputs = ports
+      .filter(p => p.direction == Input)
+      .filterNot { p =>
+        val lname = p.name.toLowerCase
+        p.tpe == ClockType || lname.contains("clock") || lname.contains("reset")
+      }
+      .filter(p => p.tpe.isInstanceOf[UIntType] || p.tpe.isInstanceOf[SIntType])
+      .filterNot(p => ctrlPortNames.contains(p.name))
+      .sortBy(_.name)  // <-- the only change vs production version
+    dataInputs.take(params.maxInputPorts).flatMap(p => sampleBitsOfPort(p, params))
+  }
+
+  def selectControlRegBitsSorted(
+    ctrlRegs:  scala.collection.Set[DefRegister],
+    dirInRegs: scala.collection.Set[DefRegister],
+    params:    HierCovParams
+  ): Seq[(Expression, String)] = {
+    val filteredDirIn = dirInRegs.filter(r => typeWidthOpt(r.tpe).getOrElse(0) > 3)
+
+    val regs = ctrlRegs
+      .filterNot(filteredDirIn.contains(_))
+      .filter(r => typeWidthOpt(r.tpe).getOrElse(0) < params.maxCtrlRegWidth)
+      .toSeq
+      .sortBy(_.name)  // <-- the only change vs production version
+
+    val bits = ListBuffer[(Expression, String)]()
+    for (reg <- regs if bits.size < params.maxRegBits) {
+      typeWidthOpt(reg.tpe).foreach { width =>
+        if (width > 0) {
+          val stride  = Math.max(1, width / Math.min(width, 8))
+          val bitIdxs = (0 until width by stride)
+          for (idx <- bitIdxs if bits.size < params.maxRegBits) {
+            bits.append((bitExtract(WRef(reg), idx, reg.tpe), s"${reg.name}[$idx]"))
+          }
+        }
+      }
+    }
+    bits.toSeq
+  }
+
   /** ExtModule input-port proxy bits — used by v9b / v9d.
     *
     * For each instance of an ExtModule child, sample bits from the child's
